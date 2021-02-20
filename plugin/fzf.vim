@@ -764,6 +764,10 @@ function! s:split(dict)
   endtry
 endfunction
 
+noremap  <silent> <Plug>(fzf-normal) <Nop>
+noremap! <silent> <Plug>(fzf-normal) <Nop>
+tnoremap <silent> <expr> <Plug>(fzf-normal) &filetype == 'fzf' ? "\<C-L>" : "\<C-\>\<C-n>"
+
 function! s:execute_term(dict, command, temps) abort
   let winrest = winrestcmd()
   let pbuf = bufnr('')
