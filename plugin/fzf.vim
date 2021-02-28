@@ -764,10 +764,11 @@ function! s:split(dict)
   endtry
 endfunction
 
-noremap  <silent> <Plug>(fzf-normal) <Nop>
-noremap! <silent> <Plug>(fzf-normal) <Nop>
+nnoremap <silent> <Plug>(fzf-insert) i
+nnoremap <silent> <Plug>(fzf-normal) <Nop>
 if exists(':tnoremap')
-  tnoremap <silent> <expr> <Plug>(fzf-normal) &filetype == 'fzf' ? "\<C-L>" : "\<C-\>\<C-n>"
+  tnoremap <silent> <Plug>(fzf-insert) <C-\><C-n>i
+  tnoremap <silent> <Plug>(fzf-normal) <C-\><C-n>
 endif
 
 function! s:execute_term(dict, command, temps) abort
@@ -782,7 +783,7 @@ function! s:execute_term(dict, command, temps) abort
   function! fzf.switch_back(inplace)
     if a:inplace && bufnr('') == self.buf
       if bufexists(self.pbuf)
-        execute 'keepalt b' self.pbuf
+        execute 'keepalt keepjumps b' self.pbuf
       endif
       " No other listed buffer
       if bufnr('') == self.buf
@@ -820,6 +821,10 @@ function! s:execute_term(dict, command, temps) abort
     call s:pushd(self.dict)
     call s:callback(self.dict, lines)
     call self.switch_back(s:getpos() == self.ppos)
+
+    if &buftype == 'terminal'
+      call feedkeys(&filetype == 'fzf' ? "\<Plug>(fzf-insert)" : "\<Plug>(fzf-normal)")
+    endif
   endfunction
 
   try
@@ -908,13 +913,9 @@ if has('nvim')
   function s:create_popup(hl, opts) abort
     let buf = nvim_create_buf(v:false, v:true)
     let opts = extend({'relative': 'editor', 'style': 'minimal'}, a:opts)
-    let border = has_key(opts, 'border') ? remove(opts, 'border') : []
     let win = nvim_open_win(buf, v:true, opts)
     call setwinvar(win, '&winhighlight', 'NormalFloat:'..a:hl)
     call setwinvar(win, '&colorcolumn', '')
-    if !empty(border)
-      call nvim_buf_set_lines(buf, 0, -1, v:true, border)
-    endif
     return buf
   endfunction
 else
