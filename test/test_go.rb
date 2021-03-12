@@ -1911,6 +1911,111 @@ class TestGoFZF < TestBase
     tmux.send_keys :Down
     tmux.until { |lines| assert_equal 2, lines.select_count }
   end
+
+  def test_interrupt_execute
+    tmux.send_keys "seq 100 | #{FZF} --bind 'ctrl-l:execute:echo executing {}; sleep 100'", :Enter
+    tmux.until { |lines| assert_equal 100, lines.item_count }
+    tmux.send_keys 'C-l'
+    tmux.until { |lines| assert lines.any_include?('executing 1') }
+    tmux.send_keys 'C-c'
+    tmux.until { |lines| assert_equal 100, lines.item_count }
+    tmux.send_keys 99
+    tmux.until { |lines| assert_equal 1, lines.match_count }
+  end
+
+  def test_kill_default_command_on_abort
+    script = tempname + '.sh'
+    writelines(script,
+               ['#!/usr/bin/env bash',
+                "echo 'Started'",
+                'while :; do sleep 1; done'])
+    system("chmod +x #{script}")
+
+    tmux.send_keys fzf.sub('FZF_DEFAULT_COMMAND=', "FZF_DEFAULT_COMMAND=#{script}"), :Enter
+    tmux.until { |lines| assert_equal 1, lines.item_count }
+    tmux.send_keys 'C-c'
+    tmux.send_keys 'C-l', 'closed'
+    tmux.until { |lines| assert_includes lines[0], 'closed' }
+    wait { refute system("pgrep -f #{script}") }
+  ensure
+    system("pkill -9 -f #{script}")
+    begin
+      File.unlink(script)
+    rescue StandardError
+      nil
+    end
+  end
+
+  def test_kill_default_command_on_accept
+    script = tempname + '.sh'
+    writelines(script,
+               ['#!/usr/bin/env bash',
+                "echo 'Started'",
+                'while :; do sleep 1; done'])
+    system("chmod +x #{script}")
+
+    tmux.send_keys fzf.sub('FZF_DEFAULT_COMMAND=', "FZF_DEFAULT_COMMAND=#{script}"), :Enter
+    tmux.until { |lines| assert_equal 1, lines.item_count }
+    tmux.send_keys :Enter
+    assert_equal 'Started', readonce.chomp
+    wait { refute system("pgrep -f #{script}") }
+  ensure
+    system("pkill -9 -f #{script}")
+    begin
+      File.unlink(script)
+    rescue StandardError
+      nil
+    end
+  end
+
+  def test_kill_reload_command_on_abort
+    script = tempname + '.sh'
+    writelines(script,
+               ['#!/usr/bin/env bash',
+                "echo 'Started'",
+                'while :; do sleep 1; done'])
+    system("chmod +x #{script}")
+
+    tmux.send_keys "seq 1 3 | #{fzf("--bind 'ctrl-r:reload(#{script})'")}", :Enter
+    tmux.until { |lines| assert_equal 3, lines.item_count }
+    tmux.send_keys 'C-r'
+    tmux.until { |lines| assert_equal 1, lines.item_count }
+    tmux.send_keys 'C-c'
+    tmux.send_keys 'C-l', 'closed'
+    tmux.until { |lines| assert_includes lines[0], 'closed' }
+    wait { refute system("pgrep -f #{script}") }
+  ensure
+    system("pkill -9 -f #{script}")
+    begin
+      File.unlink(script)
+    rescue StandardError
+      nil
+    end
+  end
+
+  def test_kill_reload_command_on_accept
+    script = tempname + '.sh'
+    writelines(script,
+               ['#!/usr/bin/env bash',
+                "echo 'Started'",
+                'while :; do sleep 1; done'])
+    system("chmod +x #{script}")
+
+    tmux.send_keys "seq 1 3 | #{fzf("--bind 'ctrl-r:reload(#{script})'")}", :Enter
+    tmux.until { |lines| assert_equal 3, lines.item_count }
+    tmux.send_keys 'C-r'
+    tmux.until { |lines| assert_equal 1, lines.item_count }
+    tmux.send_keys :Enter
+    assert_equal 'Started', readonce.chomp
+    wait { refute system("pgrep -f #{script}") }
+  ensure
+    system("pkill -9 -f #{script}")
+    begin
+      File.unlink(script)
+    rescue StandardError
+      nil
+    end
+  end
 end
 
 module TestShell
@@ -2081,7 +2186,7 @@ module CompletionTest
     end
 
     # ~USERNAME**<TAB>
-    user = ENV['USER']
+    user = `whoami`.chomp
     tmux.send_keys 'C-u'
     tmux.send_keys "cat ~#{user}**", :Tab
     tmux.until { |lines| assert_operator lines.match_count, :>, 0 }

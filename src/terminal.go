@@ -133,6 +133,7 @@ type Terminal struct {
 	count        int
 	progress     int
 	reading      bool
+	running      bool
 	failed       *string
 	jumping      jumpMode
 	jumpLabels   string
@@ -157,6 +158,7 @@ type Terminal struct {
 	slab         *util.Slab
 	theme        *tui.ColorTheme
 	tui          tui.Renderer
+	executing    *util.AtomicBool
 }
 
 type selectedItem struct {
@@ -504,6 +506,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		ansi:        opts.Ansi,
 		tabstop:     opts.Tabstop,
 		reading:     true,
+		running:     true,
 		failed:      nil,
 		jumping:     jumpDisabled,
 		jumpLabels:  opts.JumpLabels,
@@ -525,7 +528,8 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		startChan:   make(chan bool, 1),
 		killChan:    make(chan int),
 		tui:         renderer,
-		initFunc:    func() { renderer.Init() }}
+		initFunc:    func() { renderer.Init() },
+		executing:   util.NewAtomicBool(false)}
 	t.prompt, t.promptLen = t.parsePrompt(opts.Prompt)
 	t.pointer, t.pointerLen = t.processTabs([]rune(opts.Pointer), 0)
 	t.marker, t.markerLen = t.processTabs([]rune(opts.Marker), 0)
@@ -1142,8 +1146,8 @@ func (t *Terminal) trimLeft(runes []rune, width int) ([]rune, int32) {
 	width = util.Max(0, width)
 	var trimmed int32
 	// Assume that each rune takes at least one column on screen
-	if len(runes) > width {
-		diff := len(runes) - width
+	if len(runes) > width+2 {
+		diff := len(runes) - width - 2
 		trimmed = int32(diff)
 		runes = runes[diff:]
 	}
@@ -1327,7 +1331,7 @@ func (t *Terminal) renderPreviewText(unchanged bool) {
 				} else {
 					fillRet = t.pwindow.CFill(tui.ColPreview.Fg(), tui.ColPreview.Bg(), tui.AttrRegular, str)
 				}
-				return fillRet == tui.FillContinue
+				return fillRet == tui.FillContinue || t.previewOpts.wrap && fillRet == tui.FillNextLine
 			})
 			t.previewer.scrollable = t.previewer.scrollable || t.pwindow.Y() == height-1 && t.pwindow.X() == t.pwindow.Width()
 			if fillRet == tui.FillNextLine {
@@ -1713,13 +1717,17 @@ func (t *Terminal) executeCommand(template string, forcePlus bool, background bo
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		t.tui.Pause(true)
+		t.executing.Set(true)
 		cmd.Run()
+		t.executing.Set(false)
 		t.tui.Resume(true, false)
 		t.redraw()
 		t.refresh()
 	} else {
 		t.tui.Pause(false)
+		t.executing.Set(true)
 		cmd.Run()
+		t.executing.Set(false)
 		t.tui.Resume(false, false)
 	}
 	cleanTemporaryFiles()
@@ -1820,7 +1828,7 @@ func (t *Terminal) killPreview(code int) {
 	case t.killChan <- code:
 	default:
 		if code != exitCancel {
-			os.Exit(code)
+			t.eventBox.Set(EvtQuit, code)
 		}
 	}
 }
@@ -1837,8 +1845,12 @@ func (t *Terminal) Loop() {
 		intChan := make(chan os.Signal, 1)
 		signal.Notify(intChan, os.Interrupt, syscall.SIGTERM)
 		go func() {
-			<-intChan
-			t.reqBox.Set(reqQuit, nil)
+			for s := range intChan {
+				// Don't quit by SIGINT while executing because it should be for the executing command and not for fzf itself
+				if !(s == os.Interrupt && t.executing.Get()) {
+					t.reqBox.Set(reqQuit, nil)
+				}
+			}
 		}()
 
 		contChan := make(chan os.Signal, 1)
@@ -2000,7 +2012,7 @@ func (t *Terminal) Loop() {
 								case code := <-t.killChan:
 									if code != exitCancel {
 										util.KillCommand(cmd)
-										os.Exit(code)
+										t.eventBox.Set(EvtQuit, code)
 									} else {
 										timer := time.NewTimer(previewCancelWait)
 										select {
@@ -2037,16 +2049,6 @@ func (t *Terminal) Loop() {
 		}()
 	}
 
-	exit := func(getCode func() int) {
-		t.tui.Close()
-		code := getCode()
-		if code <= exitNoMatch && t.history != nil {
-			t.history.append(string(t.input))
-		}
-		// prof.Stop()
-		t.killPreview(code)
-	}
-
 	refreshPreview := func(command string) {
 		if len(command) > 0 && t.isPreviewEnabled() {
 			_, list := t.buildPlusList(command, false)
@@ -2058,7 +2060,19 @@ func (t *Terminal) Loop() {
 	go func() {
 		var focusedIndex int32 = minItem.Index()
 		var version int64 = -1
-		for {
+		running := true
+		code := exitError
+		exit := func(getCode func() int) {
+			t.tui.Close()
+			code = getCode()
+			if code <= exitNoMatch && t.history != nil {
+				t.history.append(string(t.input))
+			}
+			running = false
+			t.mutex.Unlock()
+		}
+
+		for running {
 			t.reqBox.Wait(func(events *util.Events) {
 				defer events.Clear()
 				t.mutex.Lock()
@@ -2104,6 +2118,7 @@ func (t *Terminal) Loop() {
 							}
 							return exitNoMatch
 						})
+						return
 					case reqPreviewDisplay:
 						result := value.(previewResult)
 						if t.previewer.version != result.version {
@@ -2128,14 +2143,18 @@ func (t *Terminal) Loop() {
 							t.printer(string(t.input))
 							return exitOk
 						})
+						return
 					case reqQuit:
 						exit(func() int { return exitInterrupt })
+						return
 					}
 				}
 				t.refresh()
 				t.mutex.Unlock()
 			})
 		}
+		// prof.Stop()
+		t.killPreview(code)
 	}()
 
 	looping := true
