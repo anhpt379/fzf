@@ -1,6 +1,16 @@
 CHANGELOG
 =========
 
+0.32.2
+------
+- ANSI color sequences with colon delimiters are now supported.
+  ```sh
+  printf "\e[38;5;208mOption 1\e[m\nOption 2" | fzf --ansi
+  printf "\e[38:5:208mOption 1\e[m\nOption 2" | fzf --ansi
+  ```
+- Support `border-{up,down}` as the synonyms for `border-{top,bottom}` in
+  `--preview-window`
+
 0.32.1
 ------
 - Fixed incorrect ordering of `--tiebreak=chunk`
