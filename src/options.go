@@ -10,6 +10,7 @@ import (
 
 	"github.com/junegunn/fzf/src/algo"
 	"github.com/junegunn/fzf/src/tui"
+	"github.com/junegunn/fzf/src/util"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/mattn/go-shellwords"
@@ -70,9 +71,11 @@ const usage = `usage: fzf [options]
                            (default: 0 or center)
     --margin=MARGIN        Screen margin (TRBL | TB,RL | T,RL,B | T,R,B,L)
     --padding=PADDING      Padding inside border (TRBL | TB,RL | T,RL,B | T,R,B,L)
-    --info=STYLE           Finder info style [default|inline|hidden]
+    --info=STYLE           Finder info style [default|hidden|inline|inline:SEPARATOR]
     --separator=STR        String to form horizontal separator on info line
     --no-separator         Hide info line separator
+    --scrollbar[=CHAR]     Scrollbar character
+    --no-scrollbar         Hide scrollbar
     --prompt=STR           Input prompt (default: '> ')
     --pointer=STR          Pointer to the current line (default: '>')
     --marker=STR           Multi-select marker (default: '>')
@@ -122,6 +125,8 @@ const usage = `usage: fzf [options]
                            (e.g. '--layout=reverse --inline-info')
 
 `
+
+const defaultInfoSep = " < "
 
 // Case denotes case-sensitivity of search
 type Case int
@@ -205,6 +210,14 @@ type previewOpts struct {
 	alternative *previewOpts
 }
 
+func (o *previewOpts) Visible() bool {
+	return o.size.size > 0 || o.alternative != nil && o.alternative.size.size > 0
+}
+
+func (o *previewOpts) Toggle() {
+	o.hidden = !o.hidden
+}
+
 func parseLabelPosition(opts *labelOpts, arg string) {
 	opts.column = 0
 	opts.bottom = false
@@ -234,6 +247,10 @@ func (a previewOpts) sameLayout(b previewOpts) bool {
 
 func (a previewOpts) sameContentLayout(b previewOpts) bool {
 	return a.wrap == b.wrap && a.headerLines == b.headerLines
+}
+
+func firstLine(s string) string {
+	return strings.SplitN(s, "\n", 2)[0]
 }
 
 // Options stores the values of command-line options
@@ -267,6 +284,7 @@ type Options struct {
 	ScrollOff    int
 	FileWord     bool
 	InfoStyle    infoStyle
+	InfoSep      string
 	Separator    *string
 	JumpLabels   string
 	Prompt       string
@@ -290,6 +308,7 @@ type Options struct {
 	HeaderLines  int
 	HeaderFirst  bool
 	Ellipsis     string
+	Scrollbar    *string
 	Margin       [4]sizeSpec
 	Padding      [4]sizeSpec
 	BorderShape  tui.BorderShape
@@ -303,7 +322,7 @@ type Options struct {
 }
 
 func defaultPreviewOpts(command string) previewOpts {
-	return previewOpts{command, posRight, sizeSpec{50, true}, "", false, false, false, false, tui.BorderRounded, 0, 0, nil}
+	return previewOpts{command, posRight, sizeSpec{50, true}, "", false, false, false, false, tui.DefaultBorderShape, 0, 0, nil}
 }
 
 func defaultOptions() *Options {
@@ -359,6 +378,7 @@ func defaultOptions() *Options {
 		HeaderLines:  0,
 		HeaderFirst:  false,
 		Ellipsis:     "..",
+		Scrollbar:    nil,
 		Margin:       defaultMargin(),
 		Padding:      defaultMargin(),
 		Unicode:      true,
@@ -531,7 +551,7 @@ func parseBorder(str string, optional bool) tui.BorderShape {
 		return tui.BorderNone
 	default:
 		if optional && str == "" {
-			return tui.BorderRounded
+			return tui.DefaultBorderShape
 		}
 		errorExit("invalid border style (expected: rounded|sharp|bold|double|horizontal|vertical|top|bottom|left|right|none)")
 	}
@@ -539,8 +559,13 @@ func parseBorder(str string, optional bool) tui.BorderShape {
 }
 
 func parseKeyChords(str string, message string) map[tui.Event]string {
+	return parseKeyChordsImpl(str, message, errorExit)
+}
+
+func parseKeyChordsImpl(str string, message string, exit func(string)) map[tui.Event]string {
 	if len(str) == 0 {
-		errorExit(message)
+		exit(message)
+		return nil
 	}
 
 	str = regexp.MustCompile("(?i)(alt-),").ReplaceAllString(str, "$1"+string([]rune{escapedComma}))
@@ -590,6 +615,10 @@ func parseKeyChords(str string, message string) map[tui.Event]string {
 			add(tui.BackwardEOF)
 		case "start":
 			add(tui.Start)
+		case "load":
+			add(tui.Load)
+		case "focus":
+			add(tui.Focus)
 		case "alt-enter", "alt-return":
 			chords[tui.CtrlAltKey('m')] = key
 		case "alt-space":
@@ -672,7 +701,8 @@ func parseKeyChords(str string, message string) map[tui.Event]string {
 			} else if len(runes) == 1 {
 				chords[tui.Key(runes[0])] = key
 			} else {
-				errorExit("unsupported key: " + key)
+				exit("unsupported key: " + key)
+				return nil
 			}
 		}
 	}
@@ -845,6 +875,8 @@ func parseTheme(defaultTheme *tui.ColorTheme, str string) *tui.ColorTheme {
 				mergeAttr(&theme.Border)
 			case "separator":
 				mergeAttr(&theme.Separator)
+			case "scrollbar":
+				mergeAttr(&theme.Scrollbar)
 			case "label":
 				mergeAttr(&theme.BorderLabel)
 			case "preview-label":
@@ -890,7 +922,7 @@ const (
 
 func init() {
 	executeRegexp = regexp.MustCompile(
-		`(?si)[:+](execute(?:-multi|-silent)?|reload|preview|change-query|change-prompt|change-preview-window|change-preview|(?:re|un)bind)`)
+		`(?si)[:+](become|execute(?:-multi|-silent)?|reload(?:-sync)?|preview|(?:change|transform)-(?:query|prompt|border-label|preview-label)|change-preview-window|change-preview|(?:re|un)bind|pos|put)`)
 	splitRegexp = regexp.MustCompile("[,:]+")
 	actionNameRegexp = regexp.MustCompile("(?i)^[a-z-]+")
 }
@@ -932,7 +964,7 @@ Loop:
 		ce = regexp.QuoteMeta(ce)
 
 		// @$ or @+
-		loc = regexp.MustCompile(fmt.Sprintf(`^%s.*?(%s[+,]|%s$)`, cs, ce, ce)).FindStringIndex(action)
+		loc = regexp.MustCompile(fmt.Sprintf(`(?s)^%s.*?(%s[+,]|%s$)`, cs, ce, ce)).FindStringIndex(action)
 		if loc == nil {
 			masked += action
 			break
@@ -1080,6 +1112,10 @@ func parseActionList(masked string, original string, prevActions []*action, putA
 			appendAction(actPrevSelected)
 		case "next-selected":
 			appendAction(actNextSelected)
+		case "show-preview":
+			appendAction(actShowPreview)
+		case "hide-preview":
+			appendAction(actHidePreview)
 		case "toggle-preview":
 			appendAction(actTogglePreview)
 		case "toggle-preview-wrap":
@@ -1135,8 +1171,19 @@ func parseActionList(masked string, original string, prevActions []*action, putA
 					actionArg = spec[offset+1 : len(spec)-1]
 					actions = append(actions, &action{t: t, a: actionArg})
 				}
-				if t == actUnbind || t == actRebind {
-					parseKeyChords(actionArg, spec[0:offset]+" target required")
+				switch t {
+				case actBecome:
+					if util.IsWindows() {
+						exit("become action is not supported on Windows")
+					}
+				case actUnbind, actRebind:
+					parseKeyChordsImpl(actionArg, spec[0:offset]+" target required", exit)
+				case actChangePreviewWindow:
+					opts := previewOpts{}
+					for _, arg := range strings.Split(actionArg, "|") {
+						// Make sure that each expression is valid
+						parsePreviewWindowImpl(&opts, arg, exit)
+					}
 				}
 			}
 		}
@@ -1164,7 +1211,7 @@ func parseKeymap(keymap map[tui.Event][]*action, str string, exit func(string)) 
 		} else if len(pair[0]) == 1 && pair[0][0] == escapedPlus {
 			key = tui.Key('+')
 		} else {
-			keys := parseKeyChords(pair[0], "key name required")
+			keys := parseKeyChordsImpl(pair[0], "key name required", exit)
 			key = firstKey(keys)
 		}
 		putAllowed := key.Type == tui.Rune && unicode.IsGraphic(key.Char)
@@ -1181,14 +1228,22 @@ func isExecuteAction(str string) actionType {
 
 	prefix := actionNameRegexp.FindString(str)
 	switch prefix {
+	case "become":
+		return actBecome
 	case "reload":
 		return actReload
+	case "reload-sync":
+		return actReloadSync
 	case "unbind":
 		return actUnbind
 	case "rebind":
 		return actRebind
 	case "preview":
 		return actPreview
+	case "change-border-label":
+		return actChangeBorderLabel
+	case "change-preview-label":
+		return actChangePreviewLabel
 	case "change-preview-window":
 		return actChangePreviewWindow
 	case "change-preview":
@@ -1197,12 +1252,24 @@ func isExecuteAction(str string) actionType {
 		return actChangePrompt
 	case "change-query":
 		return actChangeQuery
+	case "pos":
+		return actPosition
 	case "execute":
 		return actExecute
 	case "execute-silent":
 		return actExecuteSilent
 	case "execute-multi":
 		return actExecuteMulti
+	case "put":
+		return actPut
+	case "transform-border-label":
+		return actTransformBorderLabel
+	case "transform-preview-label":
+		return actTransformPreviewLabel
+	case "transform-prompt":
+		return actTransformPrompt
+	case "transform-query":
+		return actTransformQuery
 	}
 	return actIgnore
 }
@@ -1270,21 +1337,29 @@ func parseLayout(str string) layoutType {
 	return layoutDefault
 }
 
-func parseInfoStyle(str string) infoStyle {
+func parseInfoStyle(str string) (infoStyle, string) {
 	switch str {
 	case "default":
-		return infoDefault
+		return infoDefault, ""
 	case "inline":
-		return infoInline
+		return infoInline, defaultInfoSep
 	case "hidden":
-		return infoHidden
+		return infoHidden, ""
 	default:
-		errorExit("invalid info style (expected: default|inline|hidden)")
+		prefix := "inline:"
+		if strings.HasPrefix(str, prefix) {
+			return infoInline, strings.ReplaceAll(str[len(prefix):], "\n", " ")
+		}
+		errorExit("invalid info style (expected: default|hidden|inline|inline:SEPARATOR)")
 	}
-	return infoDefault
+	return infoDefault, ""
 }
 
 func parsePreviewWindow(opts *previewOpts, input string) {
+	parsePreviewWindowImpl(opts, input, errorExit)
+}
+
+func parsePreviewWindowImpl(opts *previewOpts, input string, exit func(string)) {
 	tokenRegex := regexp.MustCompile(`[:,]*(<([1-9][0-9]*)\(([^)<]+)\)|[^,:]+)`)
 	sizeRegex := regexp.MustCompile("^[0-9]+%?$")
 	offsetRegex := regexp.MustCompile(`^(\+{-?[0-9]+})?([+-][0-9]+)*(-?/[1-9][0-9]*)?$`)
@@ -1356,7 +1431,8 @@ func parsePreviewWindow(opts *previewOpts, input string) {
 			} else if offsetRegex.MatchString(token) {
 				opts.scroll = token
 			} else {
-				errorExit("invalid preview window option: " + token)
+				exit("invalid preview window option: " + token)
+				return
 			}
 		}
 	}
@@ -1365,7 +1441,7 @@ func parsePreviewWindow(opts *previewOpts, input string) {
 		opts.alternative = &alternativeOpts
 		opts.alternative.hidden = false
 		opts.alternative.alternative = nil
-		parsePreviewWindow(opts.alternative, alternative)
+		parsePreviewWindowImpl(opts.alternative, alternative, exit)
 	}
 }
 
@@ -1544,12 +1620,13 @@ func parseOptions(opts *Options, allArgs []string) {
 		case "--no-filepath-word":
 			opts.FileWord = false
 		case "--info":
-			opts.InfoStyle = parseInfoStyle(
+			opts.InfoStyle, opts.InfoSep = parseInfoStyle(
 				nextString(allArgs, &i, "info style required"))
 		case "--no-info":
 			opts.InfoStyle = infoHidden
 		case "--inline-info":
 			opts.InfoStyle = infoInline
+			opts.InfoSep = defaultInfoSep
 		case "--no-inline-info":
 			opts.InfoStyle = infoDefault
 		case "--separator":
@@ -1558,6 +1635,16 @@ func parseOptions(opts *Options, allArgs []string) {
 		case "--no-separator":
 			nosep := ""
 			opts.Separator = &nosep
+		case "--scrollbar":
+			given, bar := optionalNextString(allArgs, &i)
+			if given {
+				opts.Scrollbar = &bar
+			} else {
+				opts.Scrollbar = nil
+			}
+		case "--no-scrollbar":
+			noBar := ""
+			opts.Scrollbar = &noBar
 		case "--jump-labels":
 			opts.JumpLabels = nextString(allArgs, &i, "label characters required")
 			validateJumpLabels = true
@@ -1586,10 +1673,10 @@ func parseOptions(opts *Options, allArgs []string) {
 		case "--prompt":
 			opts.Prompt = nextString(allArgs, &i, "prompt string required")
 		case "--pointer":
-			opts.Pointer = nextString(allArgs, &i, "pointer sign string required")
+			opts.Pointer = firstLine(nextString(allArgs, &i, "pointer sign string required"))
 			validatePointer = true
 		case "--marker":
-			opts.Marker = nextString(allArgs, &i, "selected sign string required")
+			opts.Marker = firstLine(nextString(allArgs, &i, "selected sign string required"))
 			validateMarker = true
 		case "--sync":
 			opts.Sync = true
@@ -1704,10 +1791,10 @@ func parseOptions(opts *Options, allArgs []string) {
 			} else if match, value := optString(arg, "--prompt="); match {
 				opts.Prompt = value
 			} else if match, value := optString(arg, "--pointer="); match {
-				opts.Pointer = value
+				opts.Pointer = firstLine(value)
 				validatePointer = true
 			} else if match, value := optString(arg, "--marker="); match {
-				opts.Marker = value
+				opts.Marker = firstLine(value)
 				validateMarker = true
 			} else if match, value := optString(arg, "-n", "--nth="); match {
 				opts.Nth = splitNth(value)
@@ -1724,9 +1811,11 @@ func parseOptions(opts *Options, allArgs []string) {
 			} else if match, value := optString(arg, "--layout="); match {
 				opts.Layout = parseLayout(value)
 			} else if match, value := optString(arg, "--info="); match {
-				opts.InfoStyle = parseInfoStyle(value)
+				opts.InfoStyle, opts.InfoSep = parseInfoStyle(value)
 			} else if match, value := optString(arg, "--separator="); match {
 				opts.Separator = &value
+			} else if match, value := optString(arg, "--scrollbar="); match {
+				opts.Scrollbar = &value
 			} else if match, value := optString(arg, "--toggle-sort="); match {
 				parseToggleSort(opts.Keymap, value)
 			} else if match, value := optString(arg, "--expect="); match {
@@ -1833,6 +1922,11 @@ func postProcessOptions(opts *Options) {
 	if !opts.Version && !tui.IsLightRendererSupported() && opts.Height.size > 0 {
 		errorExit("--height option is currently not supported on this platform")
 	}
+
+	if opts.Scrollbar != nil && runewidth.StringWidth(*opts.Scrollbar) > 1 {
+		errorExit("scrollbar display width should be 1")
+	}
+
 	// Default actions for CTRL-N / CTRL-P when --history is set
 	if opts.History != nil {
 		if _, prs := opts.Keymap[tui.CtrlP.AsEvent()]; !prs {
@@ -1844,7 +1938,6 @@ func postProcessOptions(opts *Options) {
 	}
 
 	// Extend the default key map
-	previewEnabled := len(opts.Preview.command) > 0 || hasPreviewAction(opts)
 	keymap := defaultKeymap()
 	for key, actions := range opts.Keymap {
 		var lastChangePreviewWindow *action
@@ -1855,15 +1948,6 @@ func postProcessOptions(opts *Options) {
 				opts.ToggleSort = true
 			case actChangePreviewWindow:
 				lastChangePreviewWindow = act
-				if !previewEnabled {
-					// Doesn't matter
-					continue
-				}
-				opts := previewOpts{}
-				for _, arg := range strings.Split(act.a, "|") {
-					// Make sure that each expression is valid
-					parsePreviewWindow(&opts, arg)
-				}
 			}
 		}
 
