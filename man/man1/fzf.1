@@ -92,6 +92,16 @@ interface rather than a "fuzzy finder". You can later enable the search using
 .B "+s, --no-sort"
 Do not sort the result
 .TP
+.B "--track"
+Make fzf track the current selection when the result list is updated.
+This can be useful when browsing logs using fzf with sorting disabled.
+
+.RS
+e.g.
+     \fBgit log --oneline --graph --color=always | nl |
+         fzf --ansi --track --no-sort --layout=reverse-list\fR
+.RE
+.TP
 .B "--tac"
 Reverse the order of the input
 
@@ -738,9 +748,12 @@ ncurses finder only after the input stream is complete.
 e.g. \fBfzf --multi | fzf --sync\fR
 .RE
 .TP
-.B "--listen=HTTP_PORT"
+.B "--listen[=HTTP_PORT]"
 Start HTTP server on the given port. It allows external processes to send
-actions to perform via POST method.
+actions to perform via POST method. If the port number is omitted or given as
+0, fzf will choose the port automatically and export it as \fBFZF_PORT\fR
+environment variable to the child processes started via \fBexecute\fR and
+\fBexecute-silent\fR actions.
 
 e.g.
      \fB# Start HTTP server on port 6266
@@ -748,6 +761,9 @@ e.g.
 
      # Send action to the server
      curl -XPOST localhost:6266 -d 'reload(seq 100)+change-prompt(hundred> )'
+
+     # Choose port automatically and export it as $FZF_PORT to the child process
+     fzf --listen --bind 'start:execute-silent:echo $FZF_PORT > /tmp/fzf-port'
      \fR
 .TP
 .B "--version"
@@ -977,6 +993,17 @@ e.g.
      # Beware not to introduce an infinite loop
      seq 10 | fzf --bind 'focus:up' --cycle\fR
 .RE
+\fIone\fR
+.RS
+Triggered when there's only one match. \fBone:accept\fR binding is comparable
+to \fB--select-1\fR option, but the difference is that \fB--select-1\fR is only
+effective before the interactive finder starts but \fBone\fR event is triggered
+by the interactive finder.
+
+e.g.
+     \fB# Automatically select the only match
+     seq 10 | fzf --bind one:accept\fR
+.RE
 
 \fIbackward-eof\fR
 .RS
@@ -1145,7 +1172,7 @@ set, otherwise with \fBsh -c\fR, so in this case make sure that the command is
 POSIX-compliant.
 
 \fBbecome(...)\fR action is similar to \fBexecute(...)\fR, but it replaces the
-current fzf process with the specifed command using \fBexecve(2)\fR system
+current fzf process with the specified command using \fBexecve(2)\fR system
 call.
 
     \fBfzf --bind "enter:become(vim {})"\fR
