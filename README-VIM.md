@@ -15,7 +15,7 @@ set rtp+=/usr/local/opt/fzf
 " If installed using Homebrew on Apple Silicon
 set rtp+=/opt/homebrew/opt/fzf
 
-" If installed using git
+" If you have cloned fzf on ~/.fzf directory
 set rtp+=~/.fzf
 ```
 
@@ -26,7 +26,7 @@ written as:
 " If installed using Homebrew
 Plug '/usr/local/opt/fzf'
 
-" If installed using git
+" If you have cloned fzf on ~/.fzf directory
 Plug '~/.fzf'
 ```
 
@@ -118,7 +118,7 @@ let g:fzf_action = {
 
 " An action can be a reference to a function that processes selected lines
 function! s:build_quickfix_list(lines)
-  call setqflist(map(copy(a:lines), '{ "filename": v:val }'))
+  call setqflist(map(copy(a:lines), '{ "filename": v:val, "lnum": 1 }'))
   copen
   cc
 endfunction

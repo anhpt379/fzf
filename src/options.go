@@ -33,6 +33,7 @@ const usage = `usage: fzf [options]
                            field index expressions
     -d, --delimiter=STR    Field delimiter regex (default: AWK-style)
     +s, --no-sort          Do not sort the result
+    --track                Track the current selection when the result is updated
     --tac                  Reverse the order of the input
     --disabled             Do not perform search
     --tiebreak=CRI[,..]    Comma-separated list of sort criteria to apply
@@ -116,7 +117,7 @@ const usage = `usage: fzf [options]
     --read0                Read input delimited by ASCII NUL characters
     --print0               Print output delimited by ASCII NUL characters
     --sync                 Synchronous search for multi-staged filtering
-    --listen=HTTP_PORT     Start HTTP server to receive actions (POST /)
+    --listen[=HTTP_PORT]   Start HTTP server to receive actions (POST /)
     --version              Display version information and exit
 
   Environment variables
@@ -266,6 +267,7 @@ type Options struct {
 	WithNth      []Range
 	Delimiter    Delimiter
 	Sort         int
+	Track        bool
 	Tac          bool
 	Criteria     []criterion
 	Multi        int
@@ -316,7 +318,7 @@ type Options struct {
 	PreviewLabel labelOpts
 	Unicode      bool
 	Tabstop      int
-	ListenPort   int
+	ListenPort   *int
 	ClearOnExit  bool
 	Version      bool
 }
@@ -338,6 +340,7 @@ func defaultOptions() *Options {
 		WithNth:      make([]Range, 0),
 		Delimiter:    Delimiter{},
 		Sort:         1000,
+		Track:        false,
 		Tac:          false,
 		Criteria:     []criterion{byScore, byLength},
 		Multi:        0,
@@ -619,6 +622,8 @@ func parseKeyChordsImpl(str string, message string, exit func(string)) map[tui.E
 			add(tui.Load)
 		case "focus":
 			add(tui.Focus)
+		case "one":
+			add(tui.One)
 		case "alt-enter", "alt-return":
 			chords[tui.CtrlAltKey('m')] = key
 		case "alt-space":
@@ -1562,6 +1567,10 @@ func parseOptions(opts *Options, allArgs []string) {
 			opts.Sort = optionalNumeric(allArgs, &i, 1)
 		case "+s", "--no-sort":
 			opts.Sort = 0
+		case "--track":
+			opts.Track = true
+		case "--no-track":
+			opts.Track = false
 		case "--tac":
 			opts.Tac = true
 		case "--no-tac":
@@ -1756,9 +1765,10 @@ func parseOptions(opts *Options, allArgs []string) {
 		case "--tabstop":
 			opts.Tabstop = nextInt(allArgs, &i, "tab stop required")
 		case "--listen":
-			opts.ListenPort = nextInt(allArgs, &i, "listen port required")
+			port := optionalNumeric(allArgs, &i, 0)
+			opts.ListenPort = &port
 		case "--no-listen":
-			opts.ListenPort = 0
+			opts.ListenPort = nil
 		case "--clear":
 			opts.ClearOnExit = true
 		case "--no-clear":
@@ -1849,7 +1859,8 @@ func parseOptions(opts *Options, allArgs []string) {
 			} else if match, value := optString(arg, "--tabstop="); match {
 				opts.Tabstop = atoi(value)
 			} else if match, value := optString(arg, "--listen="); match {
-				opts.ListenPort = atoi(value)
+				port := atoi(value)
+				opts.ListenPort = &port
 			} else if match, value := optString(arg, "--hscroll-off="); match {
 				opts.HscrollOff = atoi(value)
 			} else if match, value := optString(arg, "--scroll-off="); match {
@@ -1879,7 +1890,7 @@ func parseOptions(opts *Options, allArgs []string) {
 		errorExit("tab stop must be a positive integer")
 	}
 
-	if opts.ListenPort < 0 || opts.ListenPort > 65535 {
+	if opts.ListenPort != nil && (*opts.ListenPort < 0 || *opts.ListenPort > 65535) {
 		errorExit("invalid listen port")
 	}
 
@@ -2001,9 +2012,7 @@ func postProcessOptions(opts *Options) {
 		theme := opts.Theme
 		boldify := func(c tui.ColorAttr) tui.ColorAttr {
 			dup := c
-			if !theme.Colored {
-				dup.Attr |= tui.Bold
-			} else if (c.Attr & tui.AttrRegular) == 0 {
+			if (c.Attr & tui.AttrRegular) == 0 {
 				dup.Attr |= tui.Bold
 			}
 			return dup

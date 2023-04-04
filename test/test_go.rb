@@ -1930,7 +1930,7 @@ class TestGoFZF < TestBase
 
   def test_keep_right
     tmux.send_keys "seq 10000 | #{FZF} --read0 --keep-right", :Enter
-    tmux.until { |lines| assert lines.any_include?('9999 10000') }
+    tmux.until { |lines| assert lines.any_include?('9999␊10000') }
   end
 
   def test_backward_eof
@@ -2629,11 +2629,17 @@ class TestGoFZF < TestBase
   end
 
   def test_listen
-    tmux.send_keys 'seq 10 | fzf --listen 6266', :Enter
-    tmux.until { |lines| assert_equal 10, lines.item_count }
-    Net::HTTP.post(URI('http://localhost:6266'), 'change-query(yo)+reload(seq 100)+change-prompt:hundred> ')
-    tmux.until { |lines| assert_equal 100, lines.item_count }
-    tmux.until { |lines| assert_equal 'hundred> yo', lines[-1] }
+    { '--listen 6266' => -> { URI('http://localhost:6266') },
+      "--listen --sync --bind 'start:execute-silent:echo $FZF_PORT > /tmp/fzf-port'" =>
+        -> { URI("http://localhost:#{File.read('/tmp/fzf-port').chomp}") } }.each do |opts, fn|
+      tmux.send_keys "seq 10 | fzf #{opts}", :Enter
+      tmux.until { |lines| assert_equal 10, lines.item_count }
+      Net::HTTP.post(fn.call, 'change-query(yo)+reload(seq 100)+change-prompt:hundred> ')
+      tmux.until { |lines| assert_equal 100, lines.item_count }
+      tmux.until { |lines| assert_equal 'hundred> yo', lines[-1] }
+      teardown
+      setup
+    end
   end
 
   def test_toggle_alternative_preview_window
@@ -2655,6 +2661,67 @@ class TestGoFZF < TestBase
     tmux.until { |lines| assert_equal 1, lines.match_count }
     tmux.send_keys :Enter
     tmux.until { |lines| assert_equal 99, lines.item_count }
+  end
+
+  def test_no_extra_newline_issue_3209
+    tmux.send_keys(%(seq 100 | #{FZF} --height 10 --preview-window up,wrap --preview 'printf "─%.0s" $(seq 1 "$((FZF_PREVIEW_COLUMNS - 5))"); printf $"\\e[7m%s\\e[0m" title; echo; echo something'), :Enter)
+    expected = <<~OUTPUT
+      ╭──────────
+      │ ─────────
+      │ something
+      │
+      ╰──────────
+        3
+        2
+      > 1
+        100/100 ─
+      >
+    OUTPUT
+    tmux.until { assert_block(expected, _1) }
+  end
+
+  def test_track
+    tmux.send_keys "seq 1000 | #{FZF} --query 555 --track", :Enter
+    tmux.until do |lines|
+      assert_equal 1, lines.match_count
+      assert_includes lines, '> 555'
+    end
+    tmux.send_keys :BSpace
+    index = tmux.until do |lines|
+      assert_equal 28, lines.match_count
+      assert_includes lines, '> 555'
+    end.index('> 555')
+    tmux.send_keys :BSpace
+    tmux.until do |lines|
+      assert_equal 271, lines.match_count
+      assert_equal '> 555', lines[index]
+    end
+    tmux.send_keys :BSpace
+    tmux.until do |lines|
+      assert_equal 1000, lines.match_count
+      assert_equal '> 555', lines[index]
+    end
+  end
+
+  def test_one
+    tmux.send_keys "seq 10 | #{FZF} --bind 'one:preview:echo {} is the only match'", :Enter
+    tmux.send_keys '1'
+    tmux.until do |lines|
+      assert_equal 2, lines.match_count
+      refute(lines.any? { _1.include?('only match') })
+    end
+    tmux.send_keys '0'
+    tmux.until do |lines|
+      assert_equal 1, lines.match_count
+      assert(lines.any? { _1.include?('only match') })
+    end
+  end
+
+  def test_height_range_with_exit_0
+    tmux.send_keys "seq 10 | #{FZF} --height ~10% --exit-0", :Enter
+    tmux.until { |lines| assert_equal 10, lines.item_count }
+    tmux.send_keys :c
+    tmux.until { |lines| assert_equal 0, lines.match_count }
   end
 end
 
@@ -2784,9 +2851,9 @@ module TestShell
     tmux.send_keys 'C-r'
     tmux.until { |lines| assert_equal '>', lines[-1] }
     tmux.send_keys 'foo bar'
-    tmux.until { |lines| assert lines[-3]&.end_with?('bar"') }
+    tmux.until { |lines| assert lines[-3]&.match?(/bar"␊?/) }
     tmux.send_keys :Enter
-    tmux.until { |lines| assert lines[-1]&.end_with?('bar"') }
+    tmux.until { |lines| assert lines[-1]&.match?(/bar"␊?/) }
     tmux.send_keys :Enter
     tmux.until { |lines| assert_equal %w[foo bar], lines[-2..] }
   end

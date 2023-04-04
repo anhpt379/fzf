@@ -183,6 +183,7 @@ type Terminal struct {
 	multi              int
 	sort               bool
 	toggleSort         bool
+	track              bool
 	delimiter          Delimiter
 	expect             map[tui.Event]string
 	keymap             map[tui.Event][]*action
@@ -201,9 +202,8 @@ type Terminal struct {
 	tabstop            int
 	margin             [4]sizeSpec
 	padding            [4]sizeSpec
-	strong             tui.Attr
 	unicode            bool
-	listenPort         int
+	listenPort         *int
 	borderShape        tui.BorderShape
 	cleanExit          bool
 	paused             bool
@@ -538,12 +538,8 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 	}
 	var previewBox *util.EventBox
 	// We need to start previewer if HTTP server is enabled even when --preview option is not specified
-	if len(opts.Preview.command) > 0 || hasPreviewAction(opts) || opts.ListenPort > 0 {
+	if len(opts.Preview.command) > 0 || hasPreviewAction(opts) || opts.ListenPort != nil {
 		previewBox = util.NewEventBox()
-	}
-	strongAttr := tui.Bold
-	if !opts.Bold {
-		strongAttr = tui.AttrRegular
 	}
 	var renderer tui.Renderer
 	fullscreen := !opts.Height.auto && (opts.Height.size == 0 || opts.Height.percent && opts.Height.size == 100)
@@ -604,6 +600,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		multi:              opts.Multi,
 		sort:               opts.Sort > 0,
 		toggleSort:         opts.ToggleSort,
+		track:              opts.Track,
 		delimiter:          opts.Delimiter,
 		expect:             opts.Expect,
 		keymap:             opts.Keymap,
@@ -623,7 +620,6 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		previewLabelOpts:   opts.PreviewLabel,
 		cleanExit:          opts.ClearOnExit,
 		paused:             opts.Phony,
-		strong:             strongAttr,
 		cycle:              opts.Cycle,
 		headerFirst:        opts.HeaderFirst,
 		headerLines:        opts.HeaderLines,
@@ -694,11 +690,23 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 
 	_, t.hasLoadActions = t.keymap[tui.Load.AsEvent()]
 
-	if err := startHttpServer(t.listenPort, t.serverChan); err != nil {
-		errorExit(err.Error())
+	if t.listenPort != nil {
+		err, port := startHttpServer(*t.listenPort, t.serverChan)
+		if err != nil {
+			errorExit(err.Error())
+		}
+		t.listenPort = &port
 	}
 
 	return &t
+}
+
+func (t *Terminal) environ() []string {
+	env := os.Environ()
+	if t.listenPort != nil {
+		env = append(env, fmt.Sprintf("FZF_PORT=%d", *t.listenPort))
+	}
+	return env
 }
 
 func borderLines(shape tui.BorderShape) int {
@@ -740,7 +748,7 @@ func (t *Terminal) ansiLabelPrinter(str string, color *tui.ColorPair, fill bool)
 
 	// Simpler printer for strings without ANSI colors or tab characters
 	if colors == nil && strings.IndexRune(str, '\t') < 0 {
-		length := runewidth.StringWidth(str)
+		length := util.StringWidth(str)
 		if length == 0 {
 			return nil, 0
 		}
@@ -898,6 +906,10 @@ func (t *Terminal) UpdateProgress(progress float32) {
 // UpdateList updates Merger to display the list
 func (t *Terminal) UpdateList(merger *Merger, reset bool) {
 	t.mutex.Lock()
+	var prevIndex int32 = -1
+	if !reset && t.track && t.merger.Length() > 0 {
+		prevIndex = t.merger.Get(t.cy).item.Index()
+	}
 	t.progress = 100
 	t.merger = merger
 	if reset {
@@ -907,6 +919,24 @@ func (t *Terminal) UpdateList(merger *Merger, reset bool) {
 	if t.hasLoadActions && t.triggerLoad {
 		t.triggerLoad = false
 		t.eventChan <- tui.Load.AsEvent()
+	}
+	if prevIndex >= 0 {
+		pos := t.cy - t.offset
+		count := t.merger.Length()
+		i := t.merger.FindIndex(prevIndex)
+		if i >= 0 {
+			t.cy = i
+			t.offset = t.cy - pos
+		} else if t.cy > count {
+			// Try to keep the vertical position when the list shrinks
+			t.cy = count - util.Min(count, t.maxItems()) + pos
+		}
+	}
+	if !t.reading && t.merger.Length() == 1 {
+		one := tui.One.AsEvent()
+		if _, prs := t.keymap[one]; prs {
+			t.eventChan <- one
+		}
 	}
 	t.mutex.Unlock()
 	t.reqBox.Set(reqInfo, nil)
@@ -1338,8 +1368,7 @@ func (t *Terminal) updatePromptOffset() ([]rune, []rune) {
 
 	_, overflow := t.trimLeft(t.input[:t.cx], maxWidth)
 	minOffset := int(overflow)
-	maxOffset := util.Min(util.Min(len(t.input), minOffset+maxWidth), t.cx)
-
+	maxOffset := minOffset + (maxWidth-util.Max(0, maxWidth-t.cx))/2
 	t.xoffset = util.Constrain(t.xoffset, minOffset, maxOffset)
 	before, _ := t.trimLeft(t.input[t.xoffset:t.cx], maxWidth)
 	beforeLen := t.displayWidth(before)
@@ -1404,7 +1433,7 @@ func (t *Terminal) printInfo() {
 		pos = t.promptLen + t.queryLen[0] + t.queryLen[1] + 1
 		str := t.infoSep
 		maxWidth := t.window.Width() - pos
-		width := runewidth.StringWidth(str)
+		width := util.StringWidth(str)
 		if width > maxWidth {
 			trimmed, _ := t.trimRight([]rune(str), maxWidth)
 			str = string(trimmed)
@@ -1829,12 +1858,14 @@ func (t *Terminal) renderPreviewText(height int, lines []string, lineNo int, unc
 					trimmed, isTrimmed = t.trimRight(trimmed, maxWidth-t.pwindow.X())
 				}
 				str, width := t.processTabs(trimmed, prefixWidth)
-				prefixWidth += width
-				if t.theme.Colored && ansi != nil && ansi.colored() {
-					lbg = ansi.lbg
-					fillRet = t.pwindow.CFill(ansi.fg, ansi.bg, ansi.attr, str)
-				} else {
-					fillRet = t.pwindow.CFill(tui.ColPreview.Fg(), tui.ColPreview.Bg(), tui.AttrRegular, str)
+				if width > prefixWidth {
+					prefixWidth = width
+					if t.theme.Colored && ansi != nil && ansi.colored() {
+						lbg = ansi.lbg
+						fillRet = t.pwindow.CFill(ansi.fg, ansi.bg, ansi.attr, str)
+					} else {
+						fillRet = t.pwindow.CFill(tui.ColPreview.Fg(), tui.ColPreview.Bg(), tui.AttrRegular, str)
+					}
 				}
 				return !isTrimmed &&
 					(fillRet == tui.FillContinue || t.previewOpts.wrap && fillRet == tui.FillNextLine)
@@ -1937,7 +1968,7 @@ func (t *Terminal) processTabs(runes []rune, prefixWidth int) (string, int) {
 			w = t.tabstop - l%t.tabstop
 			strbuf.WriteString(strings.Repeat(" ", w))
 		} else {
-			w = runewidth.StringWidth(str)
+			w = util.StringWidth(str)
 			strbuf.WriteString(str)
 		}
 		l += w
@@ -2247,6 +2278,7 @@ func (t *Terminal) executeCommand(template string, forcePlus bool, background bo
 	}
 	command := t.replacePlaceholder(template, forcePlus, string(t.input), list)
 	cmd := util.ExecCommand(command, false)
+	cmd.Env = t.environ()
 	t.executing.Set(true)
 	if !background {
 		cmd.Stdin = tui.TtyIn()
@@ -2493,17 +2525,17 @@ func (t *Terminal) Loop() {
 					_, query := t.Input()
 					command := t.replacePlaceholder(commandTemplate, false, string(query), items)
 					cmd := util.ExecCommand(command, true)
+					env := t.environ()
 					if pwindow != nil {
 						height := pwindow.Height()
-						env := os.Environ()
 						lines := fmt.Sprintf("LINES=%d", height)
 						columns := fmt.Sprintf("COLUMNS=%d", pwindow.Width())
 						env = append(env, lines)
 						env = append(env, "FZF_PREVIEW_"+lines)
 						env = append(env, columns)
 						env = append(env, "FZF_PREVIEW_"+columns)
-						cmd.Env = env
 					}
+					cmd.Env = env
 
 					out, _ := cmd.StdoutPipe()
 					cmd.Stderr = cmd.Stdout
@@ -3289,7 +3321,7 @@ func (t *Terminal) Loop() {
 					break
 				}
 
-				// Prevew scrollbar dragging
+				// Preview scrollbar dragging
 				headerLines := t.previewOpts.headerLines
 				pbarDragging = me.Down && (pbarDragging || clicked && t.hasPreviewWindow() && my >= t.pwindow.Top()+headerLines && my < t.pwindow.Top()+t.pwindow.Height() && mx == t.pwindow.Left()+t.pwindow.Width())
 				if pbarDragging {
