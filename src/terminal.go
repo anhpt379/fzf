@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mattn/go-runewidth"
 	"github.com/rivo/uniseg"
 
 	"github.com/junegunn/fzf/src/tui"
@@ -56,6 +55,9 @@ var actionTypeRegex *regexp.Regexp
 
 const clearCode string = "\x1b[2J"
 
+// Number of maximum focus events to process synchronously
+const maxFocusEvents = 10000
+
 func init() {
 	placeholder = regexp.MustCompile(`\\?(?:{[+sf]*[0-9,-.]*}|{q}|{fzf:(?:query|action|prompt)}|{\+?f?nf?})`)
 	whiteSuffix = regexp.MustCompile(`\s*$`)
@@ -68,7 +70,7 @@ func init() {
 	// * https://sw.kovidgoyal.net/kitty/graphics-protocol
 	// * https://en.wikipedia.org/wiki/Sixel
 	// * https://iterm2.com/documentation-images.html
-	passThroughRegex = regexp.MustCompile(`\x1bPtmux;\x1b\x1b.*?[^\x1b]\x1b\\|\x1b(_G|P[0-9;]*q).*?\x1b\\\r?|\x1b]1337;.*?\a`)
+	passThroughRegex = regexp.MustCompile(`\x1bPtmux;\x1b\x1b.*?[^\x1b]\x1b\\|\x1b(_G|P[0-9;]*q).*?\x1b\\\r?|\x1b]1337;.*?(\a|\x1b\\)`)
 }
 
 type jumpMode int
@@ -251,7 +253,10 @@ type Terminal struct {
 	borderWidth        int
 	count              int
 	progress           int
+	hasResultActions   bool
+	hasFocusActions    bool
 	hasLoadActions     bool
+	hasResizeActions   bool
 	triggerLoad        bool
 	reading            bool
 	running            bool
@@ -289,6 +294,9 @@ type Terminal struct {
 	termSize           tui.TermSize
 	lastAction         actionType
 	lastFocus          int32
+	areaLines          int
+	areaColumns        int
+	forcePreview       bool
 }
 
 type selectedItem struct {
@@ -449,6 +457,17 @@ const (
 	actHideHeader
 )
 
+func (a actionType) Name() string {
+	name := ""
+	for i, r := range a.String()[3:] {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			name += "-"
+		}
+		name += string(r)
+	}
+	return strings.ToLower(name)
+}
+
 func processExecution(action actionType) bool {
 	switch action {
 	case actTransform,
@@ -483,6 +502,7 @@ type searchRequest struct {
 	sort    bool
 	sync    bool
 	command *string
+	environ []string
 	changed bool
 }
 
@@ -519,7 +539,6 @@ func defaultKeymap() map[tui.Event][]*action {
 	}
 
 	add(tui.Invalid, actInvalid)
-	add(tui.Resize, actClearScreen)
 	add(tui.CtrlA, actBeginningOfLine)
 	add(tui.CtrlB, actBackwardChar)
 	add(tui.CtrlC, actAbort)
@@ -730,6 +749,8 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		ellipsis:           opts.Ellipsis,
 		ansi:               opts.Ansi,
 		tabstop:            opts.Tabstop,
+		hasResultActions:   false,
+		hasFocusActions:    false,
 		hasLoadActions:     false,
 		triggerLoad:        false,
 		reading:            true,
@@ -757,7 +778,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		killChan:           make(chan int),
 		serverInputChan:    make(chan []*action, 10),
 		serverOutputChan:   make(chan string),
-		eventChan:          make(chan tui.Event, 3), // load / zero|one | GetChar
+		eventChan:          make(chan tui.Event, 6), // (load + result + zero|one) | (focus) | (resize) | (GetChar)
 		tui:                renderer,
 		initFunc:           func() { renderer.Init() },
 		executing:          util.NewAtomicBool(false),
@@ -781,7 +802,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		t.separator, t.separatorLen = t.ansiLabelPrinter(bar, &tui.ColSeparator, true)
 	}
 	if t.unicode {
-		t.borderWidth = runewidth.RuneWidth('│')
+		t.borderWidth = uniseg.StringWidth("│")
 	}
 	if opts.Scrollbar == nil {
 		if t.unicode && t.borderWidth == 1 {
@@ -801,10 +822,17 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		}
 	}
 
+	var resizeActions []*action
+	resizeActions, t.hasResizeActions = t.keymap[tui.Resize.AsEvent()]
+	if t.tui.ShouldEmitResizeEvent() {
+		t.keymap[tui.Resize.AsEvent()] = append(toActions(actClearScreen), resizeActions...)
+	}
+	_, t.hasResultActions = t.keymap[tui.Result.AsEvent()]
+	_, t.hasFocusActions = t.keymap[tui.Focus.AsEvent()]
 	_, t.hasLoadActions = t.keymap[tui.Load.AsEvent()]
 
 	if t.listenAddr != nil {
-		err, port := startHttpServer(*t.listenAddr, t.serverInputChan, t.serverOutputChan)
+		port, err := startHttpServer(*t.listenAddr, t.serverInputChan, t.serverOutputChan)
 		if err != nil {
 			errorExit(err.Error())
 		}
@@ -819,6 +847,14 @@ func (t *Terminal) environ() []string {
 	if t.listenPort != nil {
 		env = append(env, fmt.Sprintf("FZF_PORT=%d", *t.listenPort))
 	}
+	env = append(env, "FZF_QUERY="+string(t.input))
+	env = append(env, "FZF_ACTION="+t.lastAction.Name())
+	env = append(env, "FZF_PROMPT="+string(t.promptString))
+	env = append(env, fmt.Sprintf("FZF_TOTAL_COUNT=%d", t.count))
+	env = append(env, fmt.Sprintf("FZF_MATCH_COUNT=%d", t.merger.Length()))
+	env = append(env, fmt.Sprintf("FZF_SELECT_COUNT=%d", len(t.selected)))
+	env = append(env, fmt.Sprintf("FZF_LINES=%d", t.areaLines))
+	env = append(env, fmt.Sprintf("FZF_COLUMNS=%d", t.areaColumns))
 	return env
 }
 
@@ -1024,11 +1060,11 @@ func (t *Terminal) UpdateProgress(progress float32) {
 // UpdateList updates Merger to display the list
 func (t *Terminal) UpdateList(merger *Merger) {
 	t.mutex.Lock()
-	var prevIndex int32 = -1
+	prevIndex := minItem.Index()
 	reset := t.revision != merger.Revision()
 	if !reset && t.track != trackDisabled {
 		if t.merger.Length() > 0 {
-			prevIndex = t.merger.Get(t.cy).item.Index()
+			prevIndex = t.currentIndex()
 		} else if merger.Length() > 0 {
 			prevIndex = merger.First().item.Index()
 		}
@@ -1072,6 +1108,9 @@ func (t *Terminal) UpdateList(merger *Merger) {
 			if _, prs := t.keymap[one]; prs {
 				t.eventChan <- one
 			}
+		}
+		if t.hasResultActions {
+			t.eventChan <- tui.Result.AsEvent()
 		}
 	}
 	t.mutex.Unlock()
@@ -1220,6 +1259,7 @@ func (t *Terminal) adjustMarginAndPadding() (int, int, [4]int, [4]int) {
 }
 
 func (t *Terminal) resizeWindows(forcePreview bool) {
+	t.forcePreview = forcePreview
 	screenWidth, screenHeight, marginInt, paddingInt := t.adjustMarginAndPadding()
 	width := screenWidth - marginInt[1] - marginInt[3]
 	height := screenHeight - marginInt[0] - marginInt[2]
@@ -1281,6 +1321,9 @@ func (t *Terminal) resizeWindows(forcePreview bool) {
 	}
 	width -= paddingInt[1] + paddingInt[3]
 	height -= paddingInt[0] + paddingInt[2]
+
+	t.areaLines = height
+	t.areaColumns = width
 
 	// Set up preview window
 	noBorder := tui.MakeBorderStyle(tui.BorderNone, t.unicode)
@@ -2279,7 +2322,7 @@ func (t *Terminal) processTabs(runes []rune, prefixWidth int) (string, int) {
 }
 
 func (t *Terminal) printAll() {
-	t.resizeWindows(false)
+	t.resizeWindows(t.forcePreview)
 	t.printList()
 	t.printPrompt()
 	t.printInfo()
@@ -2534,14 +2577,7 @@ func replacePlaceholder(params replacePlaceholderParams) string {
 				}
 			}
 		case match == "{fzf:action}":
-			name := ""
-			for i, r := range params.lastAction.String()[3:] {
-				if i > 0 && r >= 'A' && r <= 'Z' {
-					name += "-"
-				}
-				name += string(r)
-			}
-			return strings.ToLower(name)
+			return params.lastAction.Name()
 		case match == "{fzf:prompt}":
 			return quoteEntry(params.prompt)
 		default:
@@ -2826,14 +2862,16 @@ func (t *Terminal) Loop() {
 			}
 		}()
 
-		resizeChan := make(chan os.Signal, 1)
-		notifyOnResize(resizeChan) // Non-portable
-		go func() {
-			for {
-				<-resizeChan
-				t.reqBox.Set(reqResize, nil)
-			}
-		}()
+		if !t.tui.ShouldEmitResizeEvent() {
+			resizeChan := make(chan os.Signal, 1)
+			notifyOnResize(resizeChan) // Non-portable
+			go func() {
+				for {
+					<-resizeChan
+					t.reqBox.Set(reqResize, nil)
+				}
+			}()
+		}
 
 		t.mutex.Lock()
 		t.initFunc()
@@ -3070,9 +3108,9 @@ func (t *Terminal) Loop() {
 							t.track = trackDisabled
 							t.printInfo()
 						}
-						if onFocus, prs := t.keymap[tui.Focus.AsEvent()]; prs && focusChanged && currentIndex != t.lastFocus {
-							t.lastFocus = focusedIndex
-							t.serverInputChan <- onFocus
+						if t.hasFocusActions && focusChanged && currentIndex != t.lastFocus {
+							t.lastFocus = currentIndex
+							t.eventChan <- tui.Focus.AsEvent()
 						}
 						if focusChanged || version != t.version {
 							version = t.version
@@ -3104,6 +3142,9 @@ func (t *Terminal) Loop() {
 						if wasHidden && t.hasPreviewWindow() {
 							refreshPreview(t.previewOpts.command)
 						}
+						if req == reqResize && t.hasResizeActions {
+							t.eventChan <- tui.Resize.AsEvent()
+						}
 					case reqClose:
 						exit(func() int {
 							if t.output() {
@@ -3123,7 +3164,7 @@ func (t *Terminal) Loop() {
 						}
 						t.previewer.lines = result.lines
 						t.previewer.spinner = result.spinner
-						if t.previewer.following.Enabled() {
+						if t.hasPreviewWindow() && t.previewer.following.Enabled() {
 							t.previewer.offset = util.Max(t.previewer.offset, len(t.previewer.lines)-(t.pwindow.Height()-t.previewOpts.headerLines))
 						} else if result.offset >= 0 {
 							t.previewer.offset = util.Constrain(result.offset, t.previewOpts.headerLines, len(t.previewer.lines)-1)
@@ -3186,7 +3227,11 @@ func (t *Terminal) Loop() {
 			}
 			select {
 			case event = <-t.eventChan:
-				needBarrier = !event.Is(tui.Load, tui.One, tui.Zero)
+				if t.tui.ShouldEmitResizeEvent() {
+					needBarrier = !event.Is(tui.Load, tui.Result, tui.Focus, tui.One, tui.Zero)
+				} else {
+					needBarrier = !event.Is(tui.Load, tui.Result, tui.Focus, tui.One, tui.Zero, tui.Resize)
+				}
 			case serverActions := <-t.serverInputChan:
 				event = tui.Invalid.AsEvent()
 				if t.listenAddr == nil || t.listenAddr.IsLocal() || t.listenUnsafe {
@@ -3263,18 +3308,22 @@ func (t *Terminal) Loop() {
 		var doAction func(*action) bool
 		var doActions func(actions []*action) bool
 		doActions = func(actions []*action) bool {
-			currentIndex := t.currentIndex()
-			for _, action := range actions {
-				if !doAction(action) {
-					return false
+			for iter := 0; iter <= maxFocusEvents; iter++ {
+				currentIndex := t.currentIndex()
+				for _, action := range actions {
+					if !doAction(action) {
+						return false
+					}
 				}
-			}
 
-			if onFocus, prs := t.keymap[tui.Focus.AsEvent()]; prs {
-				if newIndex := t.currentIndex(); newIndex != currentIndex {
-					t.lastFocus = newIndex
-					return doActions(onFocus)
+				if onFocus, prs := t.keymap[tui.Focus.AsEvent()]; prs && iter < maxFocusEvents {
+					if newIndex := t.currentIndex(); newIndex != currentIndex {
+						t.lastFocus = newIndex
+						actions = onFocus
+						continue
+					}
 				}
+				break
 			}
 			return true
 		}
@@ -3340,6 +3389,9 @@ func (t *Terminal) Loop() {
 						// Discard the preview content so that it won't accidentally appear
 						// when preview window is re-enabled and previewDelay is triggered
 						t.previewer.lines = nil
+
+						// Also kill the preview process if it's still running
+						t.cancelPreview()
 					}
 				}
 			case actTogglePreviewWrap:
@@ -3449,7 +3501,9 @@ func (t *Terminal) Loop() {
 				t.prompt, t.promptLen = t.parsePrompt(a.a)
 				req(reqPrompt)
 			case actPreview:
-				updatePreviewWindow(true)
+				if !t.hasPreviewWindow() {
+					updatePreviewWindow(true)
+				}
 				refreshPreview(a.a)
 			case actRefreshPreview:
 				refreshPreview(t.previewOpts.command)
@@ -3944,11 +3998,18 @@ func (t *Terminal) Loop() {
 
 				// Full redraw
 				if !currentPreviewOpts.sameLayout(t.previewOpts) {
-					wasHidden := t.pwindow == nil
+					// Preview command can be running in the background if the size of
+					// the preview window is 0 but not 'hidden'
+					wasHidden := currentPreviewOpts.hidden
 					updatePreviewWindow(false)
 					if wasHidden && t.hasPreviewWindow() {
+						// Restart
 						refreshPreview(t.previewOpts.command)
+					} else if t.previewOpts.hidden {
+						// Cancel
+						t.cancelPreview()
 					} else {
+						// Refresh
 						req(reqPreviewRefresh)
 					}
 				} else if !currentPreviewOpts.sameContentLayout(t.previewOpts) {
@@ -4038,10 +4099,15 @@ func (t *Terminal) Loop() {
 			req(reqPrompt)
 		}
 
+		reload := changed || newCommand != nil
+		var reloadRequest *searchRequest
+		if reload {
+			reloadRequest = &searchRequest{sort: t.sort, sync: reloadSync, command: newCommand, environ: t.environ(), changed: changed}
+		}
 		t.mutex.Unlock() // Must be unlocked before touching reqBox
 
-		if changed || newCommand != nil {
-			t.eventBox.Set(EvtSearchNew, searchRequest{sort: t.sort, sync: reloadSync, command: newCommand, changed: changed})
+		if reload {
+			t.eventBox.Set(EvtSearchNew, *reloadRequest)
 		}
 		for _, event := range events {
 			t.reqBox.Set(event, nil)
@@ -4055,7 +4121,7 @@ func (t *Terminal) constrain() {
 	// count of lines can be displayed
 	height := t.maxItems()
 
-	t.cy = util.Constrain(t.cy, 0, count-1)
+	t.cy = util.Constrain(t.cy, 0, util.Max(0, count-1))
 
 	minOffset := util.Max(t.cy-height+1, 0)
 	maxOffset := util.Max(util.Min(count-height, t.cy), 0)

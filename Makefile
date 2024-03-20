@@ -4,7 +4,7 @@ GOOS           ?= $(word 1, $(subst /, " ", $(word 4, $(shell go version))))
 
 MAKEFILE       := $(realpath $(lastword $(MAKEFILE_LIST)))
 ROOT_DIR       := $(shell dirname $(MAKEFILE))
-SOURCES        := $(wildcard *.go src/*.go src/*/*.go) $(MAKEFILE)
+SOURCES        := $(wildcard *.go src/*.go src/*/*.go shell/*sh) $(MAKEFILE)
 
 ifdef FZF_VERSION
 VERSION        := $(FZF_VERSION)
@@ -93,7 +93,7 @@ generate:
 	PATH=$(PATH):$(GOPATH)/bin $(GO) generate ./...
 
 build:
-	goreleaser build --rm-dist --snapshot --skip-post-hooks
+	goreleaser build --clean --snapshot --skip=post-hooks
 
 release:
 	# Make sure that the tests pass and the build works
@@ -126,7 +126,7 @@ endif
 	git push origin temp --follow-tags --force
 
 	# Make a GitHub release
-	goreleaser --rm-dist --release-notes tmp/release-note
+	goreleaser --clean --release-notes tmp/release-note
 
 	# Push to master
 	git checkout master

@@ -12,8 +12,8 @@ import (
 	"github.com/junegunn/fzf/src/tui"
 	"github.com/junegunn/fzf/src/util"
 
-	"github.com/mattn/go-runewidth"
 	"github.com/mattn/go-shellwords"
+	"github.com/rivo/uniseg"
 )
 
 const usage = `usage: fzf [options]
@@ -124,10 +124,21 @@ const usage = `usage: fzf [options]
                            (To allow remote process execution, use --listen-unsafe)
     --version              Display version information and exit
 
+  Directory traversal      (Only used when $FZF_DEFAULT_COMMAND is not set)
+    --walker=OPTS          [file][,dir][,follow][,hidden] (default: file,follow,hidden)
+    --walker-root=DIR      Root directory from which to start walker (default: .)
+    --walker-skip=DIRS     Comma-separated list of directory names to skip
+                           (default: .git,node_modules)
+
+  Shell integration
+    --bash                 Print script to set up Bash shell integration
+    --zsh                  Print script to set up Zsh shell integration
+    --fish                 Print script to set up Fish shell integration
+
   Environment variables
     FZF_DEFAULT_COMMAND    Default command to use when input is tty
-    FZF_DEFAULT_OPTS       Default options
-                           (e.g. '--layout=reverse --inline-info')
+    FZF_DEFAULT_OPTS       Default options (e.g. '--layout=reverse --info=inline')
+    FZF_DEFAULT_OPTS_FILE  Location of the file to read default options from
     FZF_API_KEY            X-API-Key header for HTTP server (--listen)
 
 `
@@ -274,8 +285,18 @@ func firstLine(s string) string {
 	return strings.SplitN(s, "\n", 2)[0]
 }
 
+type walkerOpts struct {
+	file   bool
+	dir    bool
+	hidden bool
+	follow bool
+}
+
 // Options stores the values of command-line options
 type Options struct {
+	Bash         bool
+	Zsh          bool
+	Fish         bool
 	Fuzzy        bool
 	FuzzyAlgo    algo.Algo
 	Scheme       string
@@ -337,11 +358,25 @@ type Options struct {
 	BorderLabel  labelOpts
 	PreviewLabel labelOpts
 	Unicode      bool
+	Ambidouble   bool
 	Tabstop      int
 	ListenAddr   *listenAddress
 	Unsafe       bool
 	ClearOnExit  bool
+	WalkerOpts   walkerOpts
+	WalkerRoot   string
+	WalkerSkip   []string
 	Version      bool
+}
+
+func filterNonEmpty(input []string) []string {
+	output := make([]string, 0, len(input))
+	for _, str := range input {
+		if len(str) > 0 {
+			output = append(output, str)
+		}
+	}
+	return output
 }
 
 func defaultPreviewOpts(command string) previewOpts {
@@ -350,6 +385,9 @@ func defaultPreviewOpts(command string) previewOpts {
 
 func defaultOptions() *Options {
 	return &Options{
+		Bash:         false,
+		Zsh:          false,
+		Fish:         false,
 		Fuzzy:        true,
 		FuzzyAlgo:    algo.FuzzyMatchV2,
 		Scheme:       "default",
@@ -406,11 +444,15 @@ func defaultOptions() *Options {
 		Margin:       defaultMargin(),
 		Padding:      defaultMargin(),
 		Unicode:      true,
+		Ambidouble:   os.Getenv("RUNEWIDTH_EASTASIAN") == "1",
 		Tabstop:      8,
 		BorderLabel:  labelOpts{},
 		PreviewLabel: labelOpts{},
 		Unsafe:       false,
 		ClearOnExit:  true,
+		WalkerOpts:   walkerOpts{file: true, hidden: true, follow: true},
+		WalkerRoot:   ".",
+		WalkerSkip:   []string{".git", "node_modules"},
 		Version:      false}
 }
 
@@ -419,8 +461,10 @@ func help(code int) {
 	os.Exit(code)
 }
 
+var errorContext = ""
+
 func errorExit(msg string) {
-	os.Stderr.WriteString(msg + "\n")
+	os.Stderr.WriteString(errorContext + msg + "\n")
 	os.Exit(exitError)
 }
 
@@ -650,6 +694,10 @@ func parseKeyChordsImpl(str string, message string, exit func(string)) map[tui.E
 			add(tui.Load)
 		case "focus":
 			add(tui.Focus)
+		case "result":
+			add(tui.Result)
+		case "resize":
+			add(tui.Resize)
 		case "one":
 			add(tui.One)
 		case "zero":
@@ -956,6 +1004,30 @@ func parseTheme(defaultTheme *tui.ColorTheme, str string) *tui.ColorTheme {
 		}
 	}
 	return theme
+}
+
+func parseWalkerOpts(str string) walkerOpts {
+	opts := walkerOpts{}
+	for _, str := range strings.Split(strings.ToLower(str), ",") {
+		switch str {
+		case "file":
+			opts.file = true
+		case "dir":
+			opts.dir = true
+		case "hidden":
+			opts.hidden = true
+		case "follow":
+			opts.follow = true
+		case "":
+			// Ignored
+		default:
+			errorExit("invalid walker option: " + str)
+		}
+	}
+	if !opts.file && !opts.dir {
+		errorExit("at least one of 'file' or 'dir' should be specified")
+	}
+	return opts
 }
 
 var (
@@ -1591,11 +1663,24 @@ func parseOptions(opts *Options, allArgs []string) {
 		}
 	}
 	validateJumpLabels := false
-	validatePointer := false
-	validateMarker := false
 	for i := 0; i < len(allArgs); i++ {
 		arg := allArgs[i]
 		switch arg {
+		case "--bash":
+			opts.Bash = true
+			if opts.Zsh || opts.Fish {
+				errorExit("cannot specify --bash with --zsh or --fish")
+			}
+		case "--zsh":
+			opts.Zsh = true
+			if opts.Bash || opts.Fish {
+				errorExit("cannot specify --zsh with --bash or --fish")
+			}
+		case "--fish":
+			opts.Fish = true
+			if opts.Bash || opts.Zsh {
+				errorExit("cannot specify --fish with --bash or --zsh")
+			}
 		case "-h", "--help":
 			help(exitOk)
 		case "-x", "--extended":
@@ -1772,10 +1857,8 @@ func parseOptions(opts *Options, allArgs []string) {
 			opts.Prompt = nextString(allArgs, &i, "prompt string required")
 		case "--pointer":
 			opts.Pointer = firstLine(nextString(allArgs, &i, "pointer sign string required"))
-			validatePointer = true
 		case "--marker":
 			opts.Marker = firstLine(nextString(allArgs, &i, "selected sign string required"))
-			validateMarker = true
 		case "--sync":
 			opts.Sync = true
 		case "--no-sync":
@@ -1843,6 +1926,10 @@ func parseOptions(opts *Options, allArgs []string) {
 			opts.Unicode = false
 		case "--unicode":
 			opts.Unicode = true
+		case "--ambidouble":
+			opts.Ambidouble = true
+		case "--no-ambidouble":
+			opts.Ambidouble = false
 		case "--margin":
 			opts.Margin = parseMargin(
 				"margin",
@@ -1858,7 +1945,7 @@ func parseOptions(opts *Options, allArgs []string) {
 			addr := defaultListenAddr
 			if given {
 				var err error
-				err, addr = parseListenAddress(str)
+				addr, err = parseListenAddress(str)
 				if err != nil {
 					errorExit(err.Error())
 				}
@@ -1872,6 +1959,12 @@ func parseOptions(opts *Options, allArgs []string) {
 			opts.ClearOnExit = true
 		case "--no-clear":
 			opts.ClearOnExit = false
+		case "--walker":
+			opts.WalkerOpts = parseWalkerOpts(nextString(allArgs, &i, "walker options required [file][,dir][,follow][,hidden]"))
+		case "--walker-root":
+			opts.WalkerRoot = nextString(allArgs, &i, "directory required")
+		case "--walker-skip":
+			opts.WalkerSkip = filterNonEmpty(strings.Split(nextString(allArgs, &i, "directory names to ignore required"), ","))
 		case "--version":
 			opts.Version = true
 		case "--":
@@ -1901,10 +1994,8 @@ func parseOptions(opts *Options, allArgs []string) {
 				opts.Prompt = value
 			} else if match, value := optString(arg, "--pointer="); match {
 				opts.Pointer = firstLine(value)
-				validatePointer = true
 			} else if match, value := optString(arg, "--marker="); match {
 				opts.Marker = firstLine(value)
-				validateMarker = true
 			} else if match, value := optString(arg, "-n", "--nth="); match {
 				opts.Nth = splitNth(value)
 			} else if match, value := optString(arg, "--with-nth="); match {
@@ -1958,19 +2049,25 @@ func parseOptions(opts *Options, allArgs []string) {
 			} else if match, value := optString(arg, "--tabstop="); match {
 				opts.Tabstop = atoi(value)
 			} else if match, value := optString(arg, "--listen="); match {
-				err, addr := parseListenAddress(value)
+				addr, err := parseListenAddress(value)
 				if err != nil {
 					errorExit(err.Error())
 				}
 				opts.ListenAddr = &addr
 				opts.Unsafe = false
 			} else if match, value := optString(arg, "--listen-unsafe="); match {
-				err, addr := parseListenAddress(value)
+				addr, err := parseListenAddress(value)
 				if err != nil {
 					errorExit(err.Error())
 				}
 				opts.ListenAddr = &addr
 				opts.Unsafe = true
+			} else if match, value := optString(arg, "--walker="); match {
+				opts.WalkerOpts = parseWalkerOpts(value)
+			} else if match, value := optString(arg, "--walker-root="); match {
+				opts.WalkerRoot = value
+			} else if match, value := optString(arg, "--walker-skip="); match {
+				opts.WalkerSkip = filterNonEmpty(strings.Split(value, ","))
 			} else if match, value := optString(arg, "--hscroll-off="); match {
 				opts.HscrollOff = atoi(value)
 			} else if match, value := optString(arg, "--scroll-off="); match {
@@ -2011,31 +2108,31 @@ func parseOptions(opts *Options, allArgs []string) {
 			}
 		}
 	}
-
-	if validatePointer {
-		if err := validateSign(opts.Pointer, "pointer"); err != nil {
-			errorExit(err.Error())
-		}
-	}
-
-	if validateMarker {
-		if err := validateSign(opts.Marker, "marker"); err != nil {
-			errorExit(err.Error())
-		}
-	}
 }
 
 func validateSign(sign string, signOptName string) error {
 	if sign == "" {
 		return fmt.Errorf("%v cannot be empty", signOptName)
 	}
-	if runewidth.StringWidth(sign) > 2 {
+	if uniseg.StringWidth(sign) > 2 {
 		return fmt.Errorf("%v display width should be up to 2", signOptName)
 	}
 	return nil
 }
 
 func postProcessOptions(opts *Options) {
+	if opts.Ambidouble {
+		uniseg.EastAsianAmbiguousWidth = 2
+	}
+
+	if err := validateSign(opts.Pointer, "pointer"); err != nil {
+		errorExit(err.Error())
+	}
+
+	if err := validateSign(opts.Marker, "marker"); err != nil {
+		errorExit(err.Error())
+	}
+
 	if !opts.Version && !tui.IsLightRendererSupported() && opts.Height.size > 0 {
 		errorExit("--height option is currently not supported on this platform")
 	}
@@ -2046,7 +2143,7 @@ func postProcessOptions(opts *Options) {
 			errorExit("--scrollbar should be given one or two characters")
 		}
 		for _, r := range runes {
-			if runewidth.RuneWidth(r) != 1 {
+			if uniseg.StringWidth(string(r)) != 1 {
 				errorExit("scrollbar display width should be 1")
 			}
 		}
@@ -2163,13 +2260,36 @@ func ParseOptions() *Options {
 		}
 	}
 
-	// Options from Env var
-	words, _ := shellwords.Parse(os.Getenv("FZF_DEFAULT_OPTS"))
+	// 1. Options from $FZF_DEFAULT_OPTS_FILE
+	if path := os.Getenv("FZF_DEFAULT_OPTS_FILE"); path != "" {
+		bytes, err := os.ReadFile(path)
+		if err != nil {
+			errorContext = "$FZF_DEFAULT_OPTS_FILE: "
+			errorExit(err.Error())
+		}
+
+		words, parseErr := shellwords.Parse(string(bytes))
+		if parseErr != nil {
+			errorContext = path + ": "
+			errorExit(parseErr.Error())
+		}
+		if len(words) > 0 {
+			parseOptions(opts, words)
+		}
+	}
+
+	// 2. Options from $FZF_DEFAULT_OPTS string
+	words, parseErr := shellwords.Parse(os.Getenv("FZF_DEFAULT_OPTS"))
+	errorContext = "$FZF_DEFAULT_OPTS: "
+	if parseErr != nil {
+		errorExit(parseErr.Error())
+	}
 	if len(words) > 0 {
 		parseOptions(opts, words)
 	}
 
-	// Options from command-line arguments
+	// 3. Options from command-line arguments
+	errorContext = ""
 	parseOptions(opts, os.Args[1:])
 
 	postProcessOptions(opts)
