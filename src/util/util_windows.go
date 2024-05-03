@@ -6,14 +6,23 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
 )
 
+type shellType int
+
+const (
+	shellTypeUnknown shellType = iota
+	shellTypeCmd
+	shellTypePowerShell
+)
+
 type Executor struct {
 	shell     string
+	shellType shellType
 	args      []string
 	shellPath atomic.Value
 }
@@ -27,16 +36,20 @@ func NewExecutor(withShell string) *Executor {
 		shell = "cmd"
 	}
 
+	shellType := shellTypeUnknown
+	basename := filepath.Base(shell)
 	if len(args) > 0 {
 		args = args[1:]
-	} else if strings.Contains(shell, "cmd") {
+	} else if strings.HasPrefix(basename, "cmd") {
+		shellType = shellTypeCmd
 		args = []string{"/v:on/s/c"}
-	} else if strings.Contains(shell, "pwsh") || strings.Contains(shell, "powershell") {
+	} else if strings.HasPrefix(basename, "pwsh") || strings.HasPrefix(basename, "powershell") {
+		shellType = shellTypePowerShell
 		args = []string{"-NoProfile", "-Command"}
 	} else {
 		args = []string{"-c"}
 	}
-	return &Executor{shell: shell, args: args}
+	return &Executor{shell: shell, shellType: shellType, args: args}
 }
 
 // ExecCommand executes the given command with $SHELL
@@ -58,7 +71,7 @@ func (x *Executor) ExecCommand(command string, setpgid bool) *exec.Cmd {
 		x.shellPath.Store(shell)
 	}
 	var cmd *exec.Cmd
-	if strings.Contains(shell, "cmd") {
+	if x.shellType == shellTypeCmd {
 		cmd = exec.Command(shell)
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			HideWindow:    false,
@@ -95,21 +108,55 @@ func (x *Executor) Become(stdin *os.File, environ []string, command string) {
 	Exit(0)
 }
 
+func escapeArg(s string) string {
+	b := make([]byte, 0, len(s)+2)
+	b = append(b, '"')
+	slashes := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		default:
+			slashes = 0
+		case '\\':
+			slashes++
+		case '&', '|', '<', '>', '(', ')', '@', '^', '%', '!':
+			b = append(b, '^')
+		case '"':
+			for ; slashes > 0; slashes-- {
+				b = append(b, '\\')
+			}
+			b = append(b, '\\')
+		}
+		b = append(b, c)
+	}
+	for ; slashes > 0; slashes-- {
+		b = append(b, '\\')
+	}
+	b = append(b, '"')
+	return string(b)
+}
+
 func (x *Executor) QuoteEntry(entry string) string {
-	if strings.Contains(x.shell, "cmd") {
-		// backslash escaping is done here for applications
-		// (see ripgrep test case in terminal_test.go#TestWindowsCommands)
-		escaped := strings.Replace(entry, `\`, `\\`, -1)
-		escaped = `"` + strings.Replace(escaped, `"`, `\"`, -1) + `"`
-		// caret is the escape character for cmd shell
-		r, _ := regexp.Compile(`[&|<>()@^%!"]`)
-		return r.ReplaceAllStringFunc(escaped, func(match string) string {
-			return "^" + match
-		})
-	} else if strings.Contains(x.shell, "pwsh") || strings.Contains(x.shell, "powershell") {
+	switch x.shellType {
+	case shellTypeCmd:
+		/* Manually tested with the following commands:
+		   fzf --preview "echo {}"
+		   fzf --preview "type {}"
+		   echo .git\refs\| fzf --preview "dir {}"
+		   echo .git\refs\\| fzf --preview "dir {}"
+		   echo .git\refs\\\| fzf --preview "dir {}"
+		   reg query HKCU | fzf --reverse --bind "enter:reload(reg query {})"
+		   fzf --disabled --preview "echo {q} {n} {}" --query "&|<>()@^%!"
+		   fd -H --no-ignore -td -d 4 | fzf --preview "dir {}"
+		   fd -H --no-ignore -td -d 4 | fzf --preview "eza {}" --preview-window up
+		   fd -H --no-ignore -td -d 4 | fzf --preview "eza --color=always --tree --level=3 --icons=always {}"
+		   fd -H --no-ignore -td -d 4 | fzf --preview ".\eza.exe --color=always --tree --level=3 --icons=always {}" --with-shell "powershell -NoProfile -Command"
+		*/
+		return escapeArg(entry)
+	case shellTypePowerShell:
 		escaped := strings.Replace(entry, `"`, `\"`, -1)
 		return "'" + strings.Replace(escaped, "'", "''", -1) + "'"
-	} else {
+	default:
 		return "'" + strings.Replace(entry, "'", "'\\''", -1) + "'"
 	}
 }
