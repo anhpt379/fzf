@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -19,6 +20,8 @@ const (
 	shellTypeCmd
 	shellTypePowerShell
 )
+
+var escapeRegex = regexp.MustCompile(`[&|<>()^%!"]`)
 
 type Executor struct {
 	shell     string
@@ -42,7 +45,7 @@ func NewExecutor(withShell string) *Executor {
 		args = args[1:]
 	} else if strings.HasPrefix(basename, "cmd") {
 		shellType = shellTypeCmd
-		args = []string{"/v:on/s/c"}
+		args = []string{"/s/c"}
 	} else if strings.HasPrefix(basename, "pwsh") || strings.HasPrefix(basename, "powershell") {
 		shellType = shellTypePowerShell
 		args = []string{"-NoProfile", "-Command"}
@@ -97,15 +100,15 @@ func (x *Executor) Become(stdin *os.File, environ []string, command string) {
 	err := cmd.Start()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fzf (become): %s\n", err.Error())
-		Exit(127)
+		os.Exit(127)
 	}
 	err = cmd.Wait()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
-			Exit(exitError.ExitCode())
+			os.Exit(exitError.ExitCode())
 		}
 	}
-	Exit(0)
+	os.Exit(0)
 }
 
 func escapeArg(s string) string {
@@ -119,8 +122,6 @@ func escapeArg(s string) string {
 			slashes = 0
 		case '\\':
 			slashes++
-		case '&', '|', '<', '>', '(', ')', '@', '^', '%', '!':
-			b = append(b, '^')
 		case '"':
 			for ; slashes > 0; slashes-- {
 				b = append(b, '\\')
@@ -133,7 +134,9 @@ func escapeArg(s string) string {
 		b = append(b, '\\')
 	}
 	b = append(b, '"')
-	return string(b)
+	return escapeRegex.ReplaceAllStringFunc(string(b), func(match string) string {
+		return "^" + match
+	})
 }
 
 func (x *Executor) QuoteEntry(entry string) string {
@@ -154,10 +157,10 @@ func (x *Executor) QuoteEntry(entry string) string {
 		*/
 		return escapeArg(entry)
 	case shellTypePowerShell:
-		escaped := strings.Replace(entry, `"`, `\"`, -1)
-		return "'" + strings.Replace(escaped, "'", "''", -1) + "'"
+		escaped := strings.ReplaceAll(entry, `"`, `\"`)
+		return "'" + strings.ReplaceAll(escaped, "'", "''") + "'"
 	default:
-		return "'" + strings.Replace(entry, "'", "'\\''", -1) + "'"
+		return "'" + strings.ReplaceAll(entry, "'", "'\\''") + "'"
 	}
 }
 
