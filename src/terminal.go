@@ -617,6 +617,8 @@ func defaultKeymap() map[tui.Event][]*action {
 	if !util.IsWindows() {
 		add(tui.CtrlZ, actSigStop)
 	}
+	add(tui.CtrlSlash, actToggleWrap)
+	addEvent(tui.AltKey('/'), actToggleWrap)
 
 	addEvent(tui.AltKey('b'), actBackwardWord)
 	add(tui.ShiftLeft, actBackwardWord)
@@ -726,7 +728,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		}
 	}
 	if fullscreen {
-		if !tui.IsLightRendererSupported() {
+		if tui.HasFullscreenRenderer() {
 			renderer = tui.NewFullscreenRenderer(opts.Theme, opts.Black, opts.Mouse)
 		} else {
 			renderer, err = tui.NewLightRenderer(ttyin, opts.Theme, opts.Black, opts.Mouse, opts.Tabstop, opts.ClearOnExit,
@@ -2273,6 +2275,7 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 
 	finalLineNum := lineNum
 	topCutoff := false
+	skipLines := 0
 	wrapped := false
 	if t.multiLine || t.wrap {
 		// Cut off the upper lines in the 'default' layout
@@ -2285,7 +2288,7 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 				wrapped = true
 			}
 
-			lines = lines[len(lines)-maxLines:]
+			skipLines = len(lines) - maxLines
 			topCutoff = true
 		}
 	}
@@ -2321,6 +2324,10 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 			}
 		}
 		from += len(line)
+		if lineOffset < skipLines {
+			continue
+		}
+		actualLineOffset := lineOffset - skipLines
 
 		var maxe int
 		for _, offset := range offsets {
@@ -2331,7 +2338,7 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 
 		actualLineNum := lineNum
 		if t.layout == layoutDefault {
-			actualLineNum = (lineNum - lineOffset) + (numItemLines - lineOffset) - 1
+			actualLineNum = (lineNum - actualLineOffset) + (numItemLines - actualLineOffset) - 1
 		}
 		t.move(actualLineNum, 0, forceRedraw)
 
@@ -2346,13 +2353,13 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 					marker = markerTop
 				}
 			} else {
-				if lineOffset == 0 { // First line
+				if actualLineOffset == 0 { // First line
 					if topCutoff {
 						marker = markerMiddle
 					} else {
 						marker = markerTop
 					}
-				} else if lineOffset == numItemLines-1 { // Last line
+				} else if actualLineOffset == numItemLines-1 { // Last line
 					if topCutoff || !overflow {
 						marker = markerBottom
 					} else {
@@ -2937,6 +2944,10 @@ type replacePlaceholderParams struct {
 	lastAction actionType
 	prompt     string
 	executor   *util.Executor
+}
+
+func (t *Terminal) replacePlaceholderInInitialCommand(template string) (string, []string) {
+	return t.replacePlaceholder(template, false, string(t.input), []*Item{nil, nil})
 }
 
 func (t *Terminal) replacePlaceholder(template string, forcePlus bool, input string, list []*Item) (string, []string) {
@@ -4839,11 +4850,18 @@ func (t *Terminal) constrain() {
 			linesSum := 0
 
 			add := func(i int) bool {
-				lines, _ := t.numItemLines(t.merger.Get(i).item, numItems-linesSum)
+				lines, overflow := t.numItemLines(t.merger.Get(i).item, numItems-linesSum)
 				linesSum += lines
 				if linesSum >= numItems {
-					if numItemsFound == 0 {
-						numItemsFound = 1
+					/*
+						# Should show all 3 items
+						printf "file1\0file2\0file3\0" | fzf --height=5 --read0 --bind load:last --reverse
+
+						# Should not truncate the last item
+						printf "file\n1\0file\n2\0file\n3\0" | fzf --height=5 --read0 --bind load:last --reverse
+					*/
+					if numItemsFound == 0 || !overflow {
+						numItemsFound++
 					}
 					return false
 				}
