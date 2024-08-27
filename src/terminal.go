@@ -382,6 +382,7 @@ const (
 	reqRedrawPreviewLabel
 	reqClose
 	reqPrintQuery
+	reqPreviewReady
 	reqPreviewEnqueue
 	reqPreviewDisplay
 	reqPreviewRefresh
@@ -826,7 +827,6 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		headerLines:        opts.HeaderLines,
 		header:             []string{},
 		header0:            opts.Header,
-		ellipsis:           opts.Ellipsis,
 		ansi:               opts.Ansi,
 		tabstop:            opts.Tabstop,
 		hasStartActions:    false,
@@ -883,6 +883,15 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		}
 		t.separator, t.separatorLen = t.ansiLabelPrinter(bar, &tui.ColSeparator, true)
 	}
+
+	if opts.Ellipsis != nil {
+		t.ellipsis = *opts.Ellipsis
+	} else if t.unicode {
+		t.ellipsis = "··"
+	} else {
+		t.ellipsis = ".."
+	}
+
 	if t.unicode {
 		t.wrapSign = "↳ "
 		t.borderWidth = uniseg.StringWidth("│")
@@ -1067,7 +1076,7 @@ func (t *Terminal) parsePrompt(prompt string) (func(), int) {
 	//             // unless the part has a non-default ANSI state
 	loc := whiteSuffix.FindStringIndex(trimmed)
 	if loc != nil {
-		blankState := ansiOffset{[2]int32{int32(loc[0]), int32(loc[1])}, ansiState{-1, -1, tui.AttrClear, -1}}
+		blankState := ansiOffset{[2]int32{int32(loc[0]), int32(loc[1])}, ansiState{-1, -1, tui.AttrClear, -1, nil}}
 		if item.colors != nil {
 			lastColor := (*item.colors)[len(*item.colors)-1]
 			if lastColor.offset[1] < int32(loc[1]) {
@@ -2459,15 +2468,24 @@ func (t *Terminal) printColoredString(window tui.Window, text []rune, offsets []
 	var substr string
 	var prefixWidth int
 	maxOffset := int32(len(text))
+	var url *url
 	for _, offset := range offsets {
 		b := util.Constrain32(offset.offset[0], index, maxOffset)
 		e := util.Constrain32(offset.offset[1], index, maxOffset)
+		if url != nil && offset.url == nil {
+			url = nil
+			window.LinkEnd()
+		}
 
 		substr, prefixWidth = t.processTabs(text[index:b], prefixWidth)
 		window.CPrint(colBase, substr)
 
 		if b < e {
 			substr, prefixWidth = t.processTabs(text[b:e], prefixWidth)
+			if url == nil && offset.url != nil {
+				url = offset.url
+				window.LinkBegin(url.uri, url.params)
+			}
 			window.CPrint(offset.color, substr)
 		}
 
@@ -2475,6 +2493,9 @@ func (t *Terminal) printColoredString(window tui.Window, text []rune, offsets []
 		if index >= maxOffset {
 			break
 		}
+	}
+	if url != nil {
+		window.LinkEnd()
 	}
 	if index < maxOffset {
 		substr, _ = t.processTabs(text[index:], prefixWidth)
@@ -2667,11 +2688,20 @@ Loop:
 
 			var fillRet tui.FillReturn
 			prefixWidth := 0
+			var url *url
 			_, _, ansi = extractColor(line, ansi, func(str string, ansi *ansiState) bool {
 				trimmed := []rune(str)
 				isTrimmed := false
 				if !t.previewOpts.wrap {
 					trimmed, isTrimmed = t.trimRight(trimmed, maxWidth-t.pwindow.X())
+				}
+				if url == nil && ansi != nil && ansi.url != nil {
+					url = ansi.url
+					t.pwindow.LinkBegin(url.uri, url.params)
+				}
+				if url != nil && (ansi == nil || ansi.url == nil) {
+					url = nil
+					t.pwindow.LinkEnd()
 				}
 				str, width := t.processTabs(trimmed, prefixWidth)
 				if width > prefixWidth {
@@ -2686,6 +2716,9 @@ Loop:
 				return !isTrimmed &&
 					(fillRet == tui.FillContinue || t.previewOpts.wrap && fillRet == tui.FillNextLine)
 			})
+			if url != nil {
+				t.pwindow.LinkEnd()
+			}
 			t.previewer.scrollable = t.previewer.scrollable || t.pwindow.Y() == height-1 && t.pwindow.X() == t.pwindow.Width()
 			if fillRet == tui.FillNextLine {
 				continue
@@ -2697,10 +2730,14 @@ Loop:
 				break
 			}
 			if lbg >= 0 {
-				t.pwindow.CFill(-1, lbg, tui.AttrRegular,
+				fillRet = t.pwindow.CFill(-1, lbg, tui.AttrRegular,
 					strings.Repeat(" ", t.pwindow.Width()-t.pwindow.X())+"\n")
 			} else {
-				t.pwindow.Fill("\n")
+				fillRet = t.pwindow.Fill("\n")
+			}
+			if fillRet == tui.FillSuspend {
+				t.previewed.filled = true
+				break
 			}
 		}
 		lineNo++
@@ -3469,6 +3506,7 @@ func (t *Terminal) Loop() error {
 		go func() {
 			var version int64
 			stop := false
+			t.previewBox.WaitFor(reqPreviewReady)
 			for {
 				var items []*Item
 				var commandTemplate string
@@ -3496,6 +3534,9 @@ func (t *Terminal) Loop() error {
 				})
 				if stop {
 					break
+				}
+				if items == nil {
+					continue
 				}
 				version++
 				// We don't display preview window if no match
@@ -3738,6 +3779,9 @@ func (t *Terminal) Loop() error {
 						t.printHeader()
 					case reqActivate:
 						t.suppress = false
+						if t.hasPreviewer() {
+							t.previewBox.Set(reqPreviewReady, nil)
+						}
 					case reqRedrawBorderLabel:
 						t.printLabel(t.border, t.borderLabel, t.borderLabelOpts, t.borderLabelLen, t.borderShape, true)
 					case reqRedrawPreviewLabel:
