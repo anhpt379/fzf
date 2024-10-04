@@ -1,8 +1,32 @@
 CHANGELOG
 =========
 
+0.56.0
+------
+- Added `--gap[=N]` option to display empty lines between items.
+    - This can be useful to visually separate adjacent multi-line items.
+      ```sh
+      # All bash functions, highlighted
+      declare -f | perl -0777 -pe 's/^}\n/}\0/gm' |
+        bat --plain --language bash --color always |
+        fzf --read0 --ansi --reverse --multi --highlight-line --gap
+      ```
+    - Or just to make the list easier to read. For single-line items, you probably want to set `--color gutter:-1` as well to hide the gutter.
+      ```sh
+      fzf --gap --color gutter:-1
+      ```
+
 0.55.0
 ------
+_Release highlights: https://junegunn.github.io/fzf/releases/0.55.0/_
+
+- Added `exact-boundary-match` type to the search syntax. When a search term is single-quoted, fzf will search for the exact occurrences of the string with both ends at word boundaries.
+  ```sh
+  fzf --query "'here'" << EOF
+  come here
+  not there
+  EOF
+  ```
 - [bash] Fuzzy path completion is enabled for all commands
     - 1. If the default completion is not already set
     - 2. And if the current bash supports `complete -D` option

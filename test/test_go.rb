@@ -3366,6 +3366,66 @@ class TestGoFZF < TestBase
     tmux.send_keys :Space
     tmux.until { |lines| assert_includes lines[-3], 'bar' }
   end
+
+  def test_boundary_match
+    # Underscore boundaries should be ranked lower
+    {
+      default: [' x '] + %w[/x/ [x] -x- -x_ _x- _x_],
+      path: ['/x/', ' x '] + %w[[x] -x- -x_ _x- _x_],
+      history: ['[x]', '-x-', ' x '] + %w[/x/ -x_ _x- _x_]
+    }.each do |scheme, expected|
+      result = `printf -- 'xxx\n-xx\nxx-\n_x_\n_x-\n-x_\n[x]\n-x-\n x \n/x/\n' | #{FZF} -f"'x'" --scheme=#{scheme}`.lines(chomp: true)
+      assert_equal expected, result
+    end
+  end
+
+  def test_preview_window_noinfo
+    # │ 1        ││
+    tmux.send_keys %(#{FZF} --preview 'seq 1000' --preview-window top,noinfo --scrollbar --bind space:change-preview-window:info), :Enter
+    tmux.until do |lines|
+      assert lines[1]&.start_with?('│ 1')
+      assert lines[1]&.end_with?('  ││')
+    end
+    tmux.send_keys :Space
+    tmux.until do |lines|
+      assert lines[1]&.start_with?('│ 1')
+      assert lines[1]&.end_with?('1000││')
+    end
+  end
+
+  def test_gap
+    tmux.send_keys %(seq 100 | #{FZF} --gap --border --reverse), :Enter
+    block = <<~BLOCK
+      ╭─────────────────
+      │ >
+      │   100/100 ──────
+      │ > 1
+      │
+      │   2
+      │
+      │   3
+      │
+      │   4
+    BLOCK
+    tmux.until { assert_block(block, _1) }
+  end
+
+  def test_gap_2
+    tmux.send_keys %(seq 100 | #{FZF} --gap=2 --border --reverse), :Enter
+    block = <<~BLOCK
+      ╭─────────────────
+      │ >
+      │   100/100 ──────
+      │ > 1
+      │
+      │
+      │   2
+      │
+      │
+      │   3
+    BLOCK
+    tmux.until { assert_block(block, _1) }
+  end
 end
 
 module TestShell
