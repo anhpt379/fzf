@@ -51,7 +51,8 @@ var placeholder *regexp.Regexp
 var whiteSuffix *regexp.Regexp
 var offsetComponentRegex *regexp.Regexp
 var offsetTrimCharsRegex *regexp.Regexp
-var passThroughRegex *regexp.Regexp
+var passThroughBeginRegex *regexp.Regexp
+var passThroughEndTmuxRegex *regexp.Regexp
 var ttyin *os.File
 
 const clearCode string = "\x1b[2J"
@@ -74,7 +75,15 @@ func init() {
 	// * https://sw.kovidgoyal.net/kitty/graphics-protocol
 	// * https://en.wikipedia.org/wiki/Sixel
 	// * https://iterm2.com/documentation-images.html
-	passThroughRegex = regexp.MustCompile(`\x1bPtmux;\x1b\x1b.*?[^\x1b]\x1b\\|\x1b(_G|P[0-9;]*q).*?\x1b\\\r?|\x1b]1337;.*?(\a|\x1b\\)`)
+	/*
+		passThroughRegex = regexp.MustCompile(`
+			  \x1bPtmux;\x1b\x1b  .*?  [^\x1b]\x1b\\
+			| \x1b(_G|P[0-9;]*q)  .*?  \x1b\\\r?
+			| \x1b]1337;          .*?  (\a|\x1b\\)
+		`)
+	*/
+	passThroughBeginRegex = regexp.MustCompile(`\x1bPtmux;\x1b\x1b|\x1b(_G|P[0-9;]*q)|\x1b]1337;`)
+	passThroughEndTmuxRegex = regexp.MustCompile(`[^\x1b]\x1b\\`)
 }
 
 type jumpMode int
@@ -561,8 +570,6 @@ type searchRequest struct {
 
 type previewRequest struct {
 	template     string
-	pwindow      tui.Window
-	pwindowSize  tui.TermSize
 	scrollOffset int
 	list         []*Item
 	env          []string
@@ -970,6 +977,20 @@ func (t *Terminal) environ() []string {
 	env = append(env, fmt.Sprintf("FZF_POS=%d", util.Min(t.merger.Length(), t.cy+1)))
 	env = append(env, fmt.Sprintf("FZF_CLICK_HEADER_LINE=%d", t.clickHeaderLine))
 	env = append(env, fmt.Sprintf("FZF_CLICK_HEADER_COLUMN=%d", t.clickHeaderColumn))
+
+	// Add preview environment variables if preview is enabled
+	pwindowSize := t.pwindowSize()
+	if pwindowSize.Lines > 0 {
+		lines := fmt.Sprintf("LINES=%d", pwindowSize.Lines)
+		columns := fmt.Sprintf("COLUMNS=%d", pwindowSize.Columns)
+		env = append(env, lines)
+		env = append(env, "FZF_PREVIEW_"+lines)
+		env = append(env, columns)
+		env = append(env, "FZF_PREVIEW_"+columns)
+		env = append(env, fmt.Sprintf("FZF_PREVIEW_TOP=%d", t.tui.Top()+t.pwindow.Top()))
+		env = append(env, fmt.Sprintf("FZF_PREVIEW_LEFT=%d", t.pwindow.Left()))
+	}
+
 	return env
 }
 
@@ -2610,6 +2631,67 @@ func (t *Terminal) makeImageBorder(width int, top bool) string {
 	return v + strings.Repeat(" ", repeat) + v
 }
 
+func findPassThrough(line string) []int {
+	loc := passThroughBeginRegex.FindStringIndex(line)
+	if loc == nil {
+		return nil
+	}
+
+	rest := line[loc[0]:]
+	after := line[loc[1]:]
+	if strings.HasPrefix(rest, "\x1bPtmux") { // Tmux
+		eloc := passThroughEndTmuxRegex.FindStringIndex(after)
+		if eloc == nil {
+			return nil
+		}
+		return []int{loc[0], loc[1] + eloc[1]}
+	} else if strings.HasPrefix(rest, "\x1b]1337;") { // iTerm2
+		index := loc[1]
+		for {
+			after := line[index:]
+			pos := strings.IndexAny(after, "\x1b\a")
+			if pos < 0 {
+				return nil
+			}
+			if after[pos] == '\a' {
+				return []int{loc[0], index + pos + 1}
+			}
+			if pos < len(after)-1 && after[pos+1] == '\\' {
+				return []int{loc[0], index + pos + 2}
+			}
+			index += pos + 1
+		}
+	}
+	// Kitty
+	pos := strings.Index(after, "\x1b\\")
+	if pos < 0 {
+		return nil
+	}
+	if pos < len(after)-2 && after[pos+2] == '\r' {
+		return []int{loc[0], loc[1] + pos + 3}
+	}
+	return []int{loc[0], loc[1] + pos + 2}
+}
+
+func extractPassThroughs(line string) ([]string, string) {
+	passThroughs := []string{}
+	transformed := ""
+	index := 0
+	for {
+		rest := line[index:]
+		loc := findPassThrough(rest)
+		if loc == nil {
+			transformed += rest
+			break
+		}
+		passThroughs = append(passThroughs, rest[loc[0]:loc[1]])
+		transformed += line[index : index+loc[0]]
+		index += loc[1]
+	}
+
+	return passThroughs, transformed
+}
+
 func (t *Terminal) renderPreviewText(height int, lines []string, lineNo int, unchanged bool) {
 	maxWidth := t.pwindow.Width()
 	var ansi *ansiState
@@ -2624,10 +2706,7 @@ Loop:
 			ansi.lbg = -1
 		}
 
-		passThroughs := passThroughRegex.FindAllString(line, -1)
-		if passThroughs != nil {
-			line = passThroughRegex.ReplaceAllString(line, "")
-		}
+		passThroughs, line := extractPassThroughs(line)
 		line = strings.TrimLeft(strings.TrimRight(line, "\r\n"), "\r")
 
 		if lineNo >= height || t.pwindow.Y() == height-1 && t.pwindow.X() > 0 {
@@ -3519,8 +3598,6 @@ func (t *Terminal) Loop() error {
 			for {
 				var items []*Item
 				var commandTemplate string
-				var pwindow tui.Window
-				var pwindowSize tui.TermSize
 				var env []string
 				initialOffset := 0
 				t.previewBox.Wait(func(events *util.Events) {
@@ -3534,8 +3611,6 @@ func (t *Terminal) Loop() error {
 							commandTemplate = request.template
 							initialOffset = request.scrollOffset
 							items = request.list
-							pwindow = request.pwindow
-							pwindowSize = request.pwindowSize
 							env = request.env
 						}
 					}
@@ -3553,16 +3628,6 @@ func (t *Terminal) Loop() error {
 					_, query := t.Input()
 					command, tempFiles := t.replacePlaceholder(commandTemplate, false, string(query), items)
 					cmd := t.executor.ExecCommand(command, true)
-					if pwindowSize.Lines > 0 {
-						lines := fmt.Sprintf("LINES=%d", pwindowSize.Lines)
-						columns := fmt.Sprintf("COLUMNS=%d", pwindowSize.Columns)
-						env = append(env, lines)
-						env = append(env, "FZF_PREVIEW_"+lines)
-						env = append(env, columns)
-						env = append(env, "FZF_PREVIEW_"+columns)
-						env = append(env, fmt.Sprintf("FZF_PREVIEW_TOP=%d", t.tui.Top()+pwindow.Top()))
-						env = append(env, fmt.Sprintf("FZF_PREVIEW_LEFT=%d", pwindow.Left()))
-					}
 					cmd.Env = env
 
 					out, _ := cmd.StdoutPipe()
@@ -3689,7 +3754,7 @@ func (t *Terminal) Loop() error {
 		if len(command) > 0 && t.canPreview() {
 			_, list := t.buildPlusList(command, false)
 			t.cancelPreview()
-			t.previewBox.Set(reqPreviewEnqueue, previewRequest{command, t.pwindow, t.pwindowSize(), t.evaluateScrollOffset(), list, t.environ()})
+			t.previewBox.Set(reqPreviewEnqueue, previewRequest{command, t.evaluateScrollOffset(), list, t.environ()})
 		}
 	}
 
@@ -4074,7 +4139,7 @@ func (t *Terminal) Loop() error {
 						if valid {
 							t.cancelPreview()
 							t.previewBox.Set(reqPreviewEnqueue,
-								previewRequest{t.previewOpts.command, t.pwindow, t.pwindowSize(), t.evaluateScrollOffset(), list, t.environ()})
+								previewRequest{t.previewOpts.command, t.evaluateScrollOffset(), list, t.environ()})
 						}
 					} else {
 						// Discard the preview content so that it won't accidentally appear
