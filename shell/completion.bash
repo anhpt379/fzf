@@ -31,9 +31,6 @@ if [[ $- =~ i ]]; then
 
 ###########################################################
 
-# To redraw line after fzf closes (printf '\e[5n')
-bind '"\e[0n": redraw-current-line' 2> /dev/null
-
 __fzf_defaults() {
   # $1: Prepend to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
   # $2: Append to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
@@ -311,12 +308,12 @@ __fzf_generic_path_completion() {
           else
             if [[ $1 =~ dir ]]; then
               walker=dir,follow
-              rest=${FZF_COMPLETION_DIR_OPTS-}
+              eval "rest=(${FZF_COMPLETION_DIR_OPTS-})"
             else
               walker=file,dir,follow,hidden
-              rest=${FZF_COMPLETION_PATH_OPTS-}
+              eval "rest=(${FZF_COMPLETION_PATH_OPTS-})"
             fi
-            __fzf_comprun "$4" -q "$leftover" --walker "$walker" --walker-root="$dir" $rest
+            __fzf_comprun "$4" -q "$leftover" --walker "$walker" --walker-root="$dir" "${rest[@]}"
           fi | while read -r item; do
             printf "%q " "${item%$3}$3"
           done
@@ -328,6 +325,8 @@ __fzf_generic_path_completion() {
         else
           COMPREPLY=( "$cur" )
         fi
+        # To redraw line after fzf closes (printf '\e[5n')
+        bind '"\e[0n": redraw-current-line' 2> /dev/null
         printf '\e[5n'
         return 0
       fi
@@ -384,6 +383,7 @@ _fzf_complete() {
     else
       COMPREPLY=("$cur")
     fi
+    bind '"\e[0n": redraw-current-line' 2> /dev/null
     printf '\e[5n'
     return 0
   else

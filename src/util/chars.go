@@ -184,6 +184,11 @@ func (chars *Chars) TrailingWhitespaces() int {
 	return whitespaces
 }
 
+func (chars *Chars) TrimTrailingWhitespaces() {
+	whitespaces := chars.TrailingWhitespaces()
+	chars.slice = chars.slice[0 : len(chars.slice)-whitespaces]
+}
+
 func (chars *Chars) TrimSuffix(runes []rune) {
 	lastIdx := len(chars.slice)
 	firstIdx := lastIdx - len(runes)
@@ -289,9 +294,10 @@ func (chars *Chars) Lines(multiLine bool, maxLines int, wrapCols int, wrapSignWi
 			line = line[:len(line)-1]
 		}
 
+		hasWrapSign := false
 		for {
 			cols := wrapCols
-			if len(wrapped) > 0 {
+			if hasWrapSign {
 				cols -= wrapSignWidth
 			}
 			_, overflowIdx := RunesWidth(line, 0, tabstop, cols)
@@ -304,9 +310,11 @@ func (chars *Chars) Lines(multiLine bool, maxLines int, wrapCols int, wrapSignWi
 					return wrapped, true
 				}
 				wrapped = append(wrapped, line[:overflowIdx])
+				hasWrapSign = true
 				line = line[overflowIdx:]
 				continue
 			}
+			hasWrapSign = false
 
 			// Restore trailing '\n'
 			if newline {

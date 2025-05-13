@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -27,7 +28,7 @@ const (
 	maxInputBuffer  = 1024 * 1024
 )
 
-const consoleDevice string = "/dev/tty"
+const DefaultTtyDevice string = "/dev/tty"
 
 var offsetRegexp = regexp.MustCompile("(.*?)\x00?\x1b\\[([0-9]+);([0-9]+)R")
 var offsetRegexpBegin = regexp.MustCompile("^\x1b\\[[0-9]+;[0-9]+R")
@@ -95,7 +96,6 @@ func (r *LightRenderer) flushRaw(sequence string) {
 
 // Light renderer
 type LightRenderer struct {
-	closed        *util.AtomicBool
 	theme         *ColorTheme
 	mouse         bool
 	forceBlack    bool
@@ -120,6 +120,7 @@ type LightRenderer struct {
 	showCursor    bool
 
 	// Windows only
+	mutex           sync.Mutex
 	ttyinChannel    chan byte
 	inHandle        uintptr
 	outHandle       uintptr
@@ -145,13 +146,12 @@ type LightWindow struct {
 	wrapSignWidth int
 }
 
-func NewLightRenderer(ttyin *os.File, theme *ColorTheme, forceBlack bool, mouse bool, tabstop int, clearOnExit bool, fullscreen bool, maxHeightFunc func(int) int) (Renderer, error) {
-	out, err := openTtyOut()
+func NewLightRenderer(ttyDefault string, ttyin *os.File, theme *ColorTheme, forceBlack bool, mouse bool, tabstop int, clearOnExit bool, fullscreen bool, maxHeightFunc func(int) int) (Renderer, error) {
+	out, err := openTtyOut(ttyDefault)
 	if err != nil {
 		out = os.Stderr
 	}
 	r := LightRenderer{
-		closed:        util.NewAtomicBool(false),
 		theme:         theme,
 		forceBlack:    forceBlack,
 		mouse:         mouse,
@@ -213,7 +213,7 @@ func (r *LightRenderer) Init() error {
 		}
 	}
 
-	r.enableMouse()
+	r.enableModes()
 	r.csi(fmt.Sprintf("%dA", r.MaxY()-1))
 	r.csi("G")
 	r.csi("K")
@@ -271,7 +271,7 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, 
 	c, ok := r.getch(nonblock)
 	if !nonblock && !ok {
 		r.Close()
-		return nil, errors.New("failed to read " + consoleDevice)
+		return nil, errors.New("failed to read " + DefaultTtyDevice)
 	}
 
 	retries := 0
@@ -462,10 +462,11 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 				}
 				// Bracketed paste mode: \e[200~ ... \e[201~
 				if len(r.buffer) > 5 && r.buffer[3] == '0' && (r.buffer[4] == '0' || r.buffer[4] == '1') && r.buffer[5] == '~' {
-					// Immediately discard the sequence from the buffer and reread input
-					r.buffer = r.buffer[6:]
-					*sz = 0
-					return r.GetChar()
+					*sz = 6
+					if r.buffer[4] == '0' {
+						return Event{BracketedPasteBegin, 0, nil}
+					}
+					return Event{BracketedPasteEnd, 0, nil}
 				}
 				return Event{Invalid, 0, nil} // INS
 			case '3':
@@ -681,7 +682,7 @@ func (r *LightRenderer) rmcup() {
 }
 
 func (r *LightRenderer) Pause(clear bool) {
-	r.disableMouse()
+	r.disableModes()
 	r.restoreTerminal()
 	if clear {
 		if r.fullscreen {
@@ -694,12 +695,13 @@ func (r *LightRenderer) Pause(clear bool) {
 	}
 }
 
-func (r *LightRenderer) enableMouse() {
+func (r *LightRenderer) enableModes() {
 	if r.mouse {
 		r.csi("?1000h")
 		r.csi("?1002h")
 		r.csi("?1006h")
 	}
+	r.csi("?2004h") // Enable bracketed paste mode
 }
 
 func (r *LightRenderer) disableMouse() {
@@ -710,6 +712,11 @@ func (r *LightRenderer) disableMouse() {
 	}
 }
 
+func (r *LightRenderer) disableModes() {
+	r.disableMouse()
+	r.csi("?2004l")
+}
+
 func (r *LightRenderer) Resume(clear bool, sigcont bool) {
 	r.setupTerminal()
 	if clear {
@@ -718,7 +725,7 @@ func (r *LightRenderer) Resume(clear bool, sigcont bool) {
 		} else {
 			r.rmcup()
 		}
-		r.enableMouse()
+		r.enableModes()
 		r.flush()
 	} else if sigcont && !r.fullscreen && r.mouse {
 		// NOTE: SIGCONT (Coming back from CTRL-Z):
@@ -773,11 +780,10 @@ func (r *LightRenderer) Close() {
 	if !r.showCursor {
 		r.csi("?25h")
 	}
-	r.disableMouse()
+	r.disableModes()
 	r.flush()
-	r.closePlatform()
 	r.restoreTerminal()
-	r.closed.Set(true)
+	r.closePlatform()
 }
 
 func (r *LightRenderer) Top() int {

@@ -1,6 +1,78 @@
 CHANGELOG
 =========
 
+0.62.0
+------
+- Relaxed the `--color` option syntax to allow whitespace-separated entries (in addition to commas), making multi-line definitions easier to write and read
+  ```sh
+  # seoul256-light
+  fzf --style full --color='
+    fg:#616161 fg+:#616161
+    bg:#ffffff bg+:#e9e9e9 alt-bg:#f1f1f1
+    hl:#719872 hl+:#719899
+    pointer:#e12672 marker:#e17899
+    header:#719872
+    spinner:#719899 info:#727100
+    prompt:#0099bd query:#616161
+    border:#e1e1e1
+  '
+  ```
+- Added `alt-bg` color to create striped lines to visually separate rows
+  ```sh
+  fzf --color bg:237,alt-bg:238,current-bg:236 --highlight-line
+
+  declare -f | perl -0777 -pe 's/^}\n/}\0/gm' |
+    bat --plain --language bash --color always |
+    fzf --read0 --ansi --reverse --multi \
+        --color bg:237,alt-bg:238,current-bg:236 --highlight-line
+  ```
+- [fish] Improvements in CTRL-R binding (@bitraid)
+    - You can trigger CTRL-R in the middle of a command to insert the selected item
+    - You can delete history items with SHIFT-DEL
+- Bug fixes and improvements
+    - Fixed unnecessary 100ms delay after `reload` (#4364)
+    - Fixed `selected-bg` not applied to colored items (#4372)
+
+0.61.3
+------
+- Reverted #4351 as it caused `tmux run-shell 'fzf --tmux'` to fail (#4559 #4560)
+- More environment variables for child processes (#4356)
+
+0.61.2
+------
+- Fixed panic when using header border without pointer/marker (@phanen)
+- Fixed `--tmux` option when already inside a tmux popup (@peikk0)
+- Bug fixes and improvements in CTRL-T binding of fish (#4334) (@bitraid)
+- Added `--no-tty-default` option to make fzf search for the current TTY device instead of defaulting to `/dev/tty` (#4242)
+
+0.61.1
+------
+- Disable bracketed-paste mode on exit. This fixes issue where pasting breaks after running fzf on old bash versions that don't support the mode.
+
+0.61.0
+------
+- Added `--ghost=TEXT` to display a ghost text when the input is empty
+  ```sh
+  # Display "Type to search" when the input is empty
+  fzf --ghost "Type to search"
+  ```
+- Added `change-ghost` and `transform-ghost` actions for dynamically changing the ghost text
+- Added `change-pointer` and `transform-pointer` actions for dynamically changing the pointer sign
+- Added `r` flag for placeholder expression (raw mode) for unquoted output
+- Bug fixes and improvements
+
+0.60.3
+------
+- Bug fixes and improvements
+    - [fish] Enable multiple history commands insertion (#4280) (@bitraid)
+    - [walker] Append '/' to directory entries on MSYS2 (#4281)
+    - Trim trailing whitespaces after processing ANSI sequences (#4282)
+    - Remove temp files before `become` when using `--tmux` option (#4283)
+    - Fix condition for using item numlines cache (#4285) (@alex-huff)
+    - Make `--accept-nth` compatible with `--select-1` (#4287)
+    - Increase the query length limit from 300 to 1000 (#4292)
+    - [windows] Prevent fzf from consuming user input while paused (#4260)
+
 0.60.2
 ------
 - Template for `--with-nth` and `--accept-nth` now supports `{n}` which evaluates to the zero-based ordinal index of the item
